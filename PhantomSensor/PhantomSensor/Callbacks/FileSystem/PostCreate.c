@@ -678,6 +678,12 @@ Return Value:
                         Data->IoStatus.Status = STATUS_ACCESS_DENIED;
                         Data->IoStatus.Information = 0;
 
+                        // Counted in the global denial total. A revoked open is a
+                        // refusal the caller sees as ACCESS_DENIED, so it belongs in
+                        // the same total as every other refusal even though the
+                        // reason - an unsubstantiated cache hit - is not a verdict.
+                        SHADOWSTRIKE_INC_STAT(FilesBlocked);
+
                         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                                    "[ShadowStrike/PostCreate] Open revoked: path "
                                    "cache identity mismatch\n");

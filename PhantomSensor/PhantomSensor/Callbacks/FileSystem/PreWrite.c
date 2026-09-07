@@ -1013,6 +1013,11 @@ Return Value:
         Data->IoStatus.Information = 0;
         BlockWrite = TRUE;
 
+        // Counted in the global denial total like every other refusal. Without
+        // this the only record was a DbgPrintEx, which release Windows filters
+        // out, so a USB write policy denial was invisible to everything.
+        SHADOWSTRIKE_INC_STAT(FilesBlocked);
+
         DbgPrintEx(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_WARNING_LEVEL,
@@ -1039,6 +1044,14 @@ Return Value:
             Data->IoStatus.Status = STATUS_ACCESS_DENIED;
             Data->IoStatus.Information = 0;
             BlockWrite = TRUE;
+
+            // Counted in the global denial total. This one matters most of the
+            // four: a write to a canary file is a RANSOMWARE detection, and it
+            // was recorded only in CanaryFileHits - a counter nothing outside
+            // this file reads - plus a debug print. So the product could catch
+            // ransomware touching a decoy and report nothing anywhere a field
+            // log or a user could see it.
+            SHADOWSTRIKE_INC_STAT(FilesBlocked);
 
             DbgPrintEx(
                 DPFLTR_IHVDRIVER_ID,

@@ -7730,7 +7730,31 @@ public:
                     ds.TxScanSendSamples > 0
                         ? ds.TxScanSendTotalUs / ds.TxScanSendSamples
                         : 0;
+                // THE ALL-CALLBACKS DENY TOTAL, REPORTED BESIDE THE PreCreate ONE
+                // BECAUSE THE DIFFERENCE BETWEEN THEM IS THE SIGNAL.
+                //
+                // PcOperationsBlocked - reported below as blocked= - counts denials in
+                // IRP_MJ_CREATE only. The driver denies from NINE sites across FOUR
+                // callbacks: five in PreCreate, two in PreWrite, one in PreSetInfo and
+                // one in PreAcquireSection. Every one of them also increments the
+                // global FilesBlocked, which SharedDefs.h has carried since v1 and
+                // CommPort.c and MessageHandler.c both populate - and which NOTHING in
+                // user mode has ever read.
+                //
+                // So a write, a rename and a section-mapping denial were all invisible:
+                // the driver could refuse a user's file operation and the only counter
+                // that saw it was one nobody queried. That cost a real investigation.
+                // A zip extraction was denied on this endpoint, reproducibly, and
+                // blocked=0 in this very report was read as evidence that we had not
+                // done it - because blocked= cannot see a PreWrite or PreSetInfo deny.
+                //
+                // Emitted FIRST and named for its scope, so the relationship is
+                // legible at a glance: when kernelDeniedAllCallbacks exceeds blocked,
+                // a callback other than PreCreate refused something, and that
+                // difference is the whole diagnostic. Equal values mean every denial
+                // came from the create path.
                 kernelPart = std::format(
+                    "kernelDeniedAllCallbacks={} | "
                     "kernelPreCreate: total={} scanned={} blocked={} excluded={} "
                     "cached={} timeouts={} errors={} circuitOpen={} selfProt={} "
                     "catalogExempt={} "
@@ -7738,6 +7762,7 @@ public:
                     "exe={} script={} doc={} archive={} avgScanMs={} maxScanMs={} "
                     "cbSamples={} cbAvgUs={} cbMaxUs={} "
                     "txSends={} txAvgUs={} txMaxUs={} txOverruns={}",
+                    ds.FilesBlocked,
                     ds.PcTotalOperations, ds.PcOperationsScanned,
                     ds.PcOperationsBlocked, ds.PcOperationsExcluded,
                     ds.PcOperationsCached, ds.PcScanTimeouts, ds.PcScanErrors,

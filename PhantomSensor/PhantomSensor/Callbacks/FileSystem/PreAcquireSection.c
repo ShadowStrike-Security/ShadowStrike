@@ -1474,6 +1474,11 @@ IRQL:
                                HandleToULong(CurrentProcessId));
 
                     SHADOWSTRIKE_INC_STAT(SelfProtectionBlocks);
+
+                    // Also counted in the global denial total. SelfProtectionBlocks
+                    // says WHY this was refused; FilesBlocked says THAT something
+                    // was refused, and only the latter is reported to user mode.
+                    SHADOWSTRIKE_INC_STAT(FilesBlocked);
                     FltReleaseFileNameInformation(SelfProtNameInfo);
 
                     Data->IoStatus.Status = STATUS_ACCESS_DENIED;

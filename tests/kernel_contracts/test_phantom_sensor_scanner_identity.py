@@ -21529,5 +21529,146 @@ class HeuristicTrustPrecheckContractTests(unittest.TestCase):
         )
 
 
+class KernelDenialAccountingContractTests(unittest.TestCase):
+    """A refusal the user experiences must be a number somebody can read.
+
+    The driver denies file operations from THIRTEEN sites across FIVE callbacks.
+    Nine of them incremented the global FilesBlocked counter; four did not - the USB
+    write policy, the CANARY FILE deny (which is a ransomware detection), the
+    self-protection execute-mapping refusal, and the revoked open in PostCreate.
+    Those four recorded nothing but a DbgPrintEx, which release Windows filters out
+    by default.
+
+    And FilesBlocked itself, which SharedDefs.h has carried since v1 and which both
+    CommPort.c and MessageHandler.c populate, was never read by user mode.  The
+    periodic report showed blocked= from PcOperationsBlocked, which counts
+    IRP_MJ_CREATE only.
+
+    The consequence was measured, not imagined: a zip extraction was denied on a live
+    endpoint, reproducibly, and blocked=0 in that same report was read as evidence
+    that the product had not done it.  It had.  A PreWrite or PreSetInfo denial simply
+    cannot appear in that field.
+    """
+
+    _FILE_CALLBACKS = (
+        "PreCreate.c",
+        "PreWrite.c",
+        "PreSetInfo.c",
+        "PreAcquireSection.c",
+        "PostCreate.c",
+    )
+    _DENY = "Data->IoStatus.Status = STATUS_ACCESS_DENIED;"
+    _COUNTER = "SHADOWSTRIKE_INC_STAT(FilesBlocked)"
+
+    @staticmethod
+    def _callback_source(name: str) -> str:
+        matches = sorted((ROOT / "PhantomSensor").rglob(name))
+        if len(matches) != 1:
+            raise AssertionError(
+                f"expected exactly one {name} in the driver, found {len(matches)}"
+            )
+        return read_source(matches[0])
+
+    def test_every_kernel_file_denial_is_counted_in_the_reported_total(self) -> None:
+        """The general form.  Subjects are the deny sites themselves, not a list.
+
+        Derived from the artifact so a deny site added later is covered without this
+        test being edited - which is the only way this stays true, since the four
+        that were missing had all been added after the counter existed.
+        """
+        uncounted: list[str] = []
+        found = 0
+        for name in self._FILE_CALLBACKS:
+            source = self._callback_source(name)
+            lines = source.split("\n")
+            for match in re.finditer(re.escape(self._DENY), source):
+                found += 1
+                line_no = source.count("\n", 0, match.start()) + 1
+                # The enclosing region: a denial and its accounting sit together, so a
+                # window around the site is the right granularity - a brace match
+                # would climb to the whole callback.
+                window = "\n".join(
+                    lines[max(0, line_no - 14):min(len(lines), line_no + 26)]
+                )
+                if self._COUNTER not in window:
+                    uncounted.append(f"{name}:{line_no}")
+
+        self.assertGreaterEqual(
+            found,
+            10,
+            msg=(
+                f"only {found} file-callback denial sites were found; this test proves "
+                "little if the walk stopped finding them"
+            ),
+        )
+        self.assertEqual(
+            [],
+            uncounted,
+            msg=(
+                "these kernel denial sites do not increment the counter that user mode "
+                "reports, so the product can refuse a user's file operation and leave "
+                f"no number anywhere a field log can see: {uncounted}"
+            ),
+        )
+
+    @classmethod
+    def _kernel_report_call(cls) -> str:
+        """The std::format call that builds the kernel counter line.
+
+        Sliced from the call opening to its closing `);` rather than with
+        enclosing_statement, which splits inside the multi-line format literal and
+        returns a fragment of the string instead of the call.
+        """
+        source = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        marker = source.find("kernelPreCreate: total=")
+        if marker == -1:
+            raise AssertionError("the kernel counter report is no longer present")
+        start = source.rfind("std::format(", 0, marker)
+        if start == -1:
+            raise AssertionError("no std::format call wraps the kernel report")
+        return source[start:source.index(");", start)]
+
+    def test_the_periodic_report_carries_the_all_callbacks_denial_total(self) -> None:
+        call = self._kernel_report_call()
+
+        # Counted rather than assertIn: the format call is about 1.7 KB and printing
+        # it buries the message.
+        self.assertGreater(
+            call.count("ds.FilesBlocked"),
+            0,
+            msg=(
+                "the periodic report does not carry the all-callbacks denial total. "
+                "blocked= is PcOperationsBlocked, which counts IRP_MJ_CREATE only, so "
+                "without FilesBlocked a write, rename or section-mapping denial is "
+                "invisible - which is exactly how a real block was mistaken for no "
+                "block at all"
+            ),
+        )
+
+    def test_the_kernel_report_format_arity_matches_its_arguments(self) -> None:
+        """std::format throws at RUNTIME on a mismatch, on the stats thread.
+
+        A placeholder count that disagrees with the argument list compiles cleanly
+        and then takes out the periodic report the first time it runs - so the only
+        place this can be caught cheaply is here.
+        """
+        call = self._kernel_report_call()
+
+        placeholders = call.count("{}")
+        last_quote = call.rindex('",')
+        args = [a for a in call[last_quote + 2:].replace("\r\n", " ").split(",")
+                if a.strip()]
+        self.assertEqual(
+            placeholders,
+            len(args),
+            msg=(
+                f"the kernel report has {placeholders} placeholders and {len(args)} "
+                "arguments. std::format throws at runtime on a mismatch, on the thread "
+                "that produces the periodic report, so this would silently remove all "
+                "driver visibility from the field log"
+            ),
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
