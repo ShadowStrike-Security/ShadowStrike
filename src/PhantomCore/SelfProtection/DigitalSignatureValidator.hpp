@@ -722,6 +722,14 @@ struct SignatureValidatorStatistics {
     ///        than skipped analysis. The 1.0.110 field run made 121 of these calls
     ///        for a single directory path in 75 seconds.
     uint64_t unsignableTargetsRefused = 0;
+
+    /// @brief Subjects WinVerifyTrust could not read.
+    ///
+    /// CRYPT_E_FILE_ERROR is not a signature verdict: nothing was verified and
+    /// nothing was refuted.  Counted separately from unrecognisedTrustStatus so a
+    /// read failure can never be mistaken for a trust decision, and separately
+    /// from invalid signatures so it cannot be read as evidence against a file.
+    uint64_t subjectUnreadable = 0;
     uint64_t blockedSigners      = 0;
     uint64_t avgValidationTimeUs = 0;
     uint64_t stolenCertDetections = 0;

@@ -328,6 +328,7 @@ std::string SignatureValidatorStatistics::ToJson() const {
     oss << "\"revocationUndetermined\":" << revocationUndetermined << ",";
     oss << "\"unrecognisedTrustStatus\":" << unrecognisedTrustStatus << ",";
     oss << "\"unsignableTargetsRefused\":" << unsignableTargetsRefused << ",";
+    oss << "\"subjectUnreadable\":" << subjectUnreadable << ",";
     oss << "\"blockedSigners\":" << blockedSigners << ",";
     oss << "\"avgValidationTimeUs\":" << avgValidationTimeUs << ",";
     oss << "\"stolenCertDetections\":" << stolenCertDetections << ",";
@@ -1936,6 +1937,58 @@ private:
                 result.result = SignatureValidationResult::InvalidCertificate;
                 break;
 
+            // AN UNREADABLE SUBJECT IS NOT A SIGNATURE VERDICT.
+            //
+            // CRYPT_E_FILE_ERROR means WinVerifyTrust could not read the file. It
+            // did not find a bad signature; it found nothing, because it never got
+            // to look. Mapping it to InvalidSignature is the same conflation the
+            // certificate validator carried between "could not judge" and "judged
+            // and failed" - and here it had a SAFETY consequence, not just a
+            // reporting one.
+            //
+            // THE CHAIN THAT MADE IT DANGEROUS, traced rather than supposed:
+            //   1. InvalidSignature is not Error, so the tail below caches it.
+            //   2. TryGetCachedMicrosoftSigned returns
+            //      `cached->isValid && cached->isMicrosoftSigned`, which is FALSE.
+            //   3. False is a DETERMINED answer, not an absent one, so
+            //      RealTimeProtection's guard against destroying a Microsoft-signed
+            //      process on inference-class evidence takes its fall-through arm
+            //      and ALLOWS the action.
+            // A file we merely failed to read therefore became a positive assertion
+            // that it is not Microsoft-signed, disabling the control that exists
+            // because task 89's field run convicted 14 Microsoft binaries in 29
+            // seconds.
+            //
+            // MEASURED IN THE 1.0.111 FIELD RUN: 141 occurrences, and not one was a
+            // signature problem -
+            //     128  OneDrive files whose content is not local (.docx/.pdf/.xlsx)
+            //      12  C:\Windows\assembly\...\Temp\*.dll - Microsoft NGen native
+            //          images, asked about while .NET was still writing them
+            //       1  C:\pagefile.sys
+            // The directory case that accounted for all 121 occurrences in 1.0.110 is
+            // refused before this point and appears ZERO times in that run.
+            //
+            // Error is deliberately chosen over Unsigned. Unsigned would be cacheable
+            // and would assert the same false certainty; Error is excluded from the
+            // cache below, so the cache-only accessor returns nullopt, the guard sees
+            // UNDETERMINED, and it withholds. Unknown must never authorise an
+            // irreversible action.
+            //
+            // THE COST IS STATED RATHER THAN HIDDEN: an uncached result is asked
+            // again. That is a performance cost, and it is the correct trade against
+            // a cached answer that switches a safety control off. The population that
+            // pays it is bounded and shrinking - the transient NGen images disappear
+            // on their own, and the cloud-file half is what tasks 90 and 109 address.
+            // DEBUG rather than WARN for the reason recorded on the directory guard:
+            // this is per-path, and our own log writes traverse our own minifilter.
+            case CRYPT_E_FILE_ERROR:
+                result.result = SignatureValidationResult::Error;
+                m_stats.subjectUnreadable++;
+                SS_LOG_DEBUG(LOG_CATEGORY,
+                    L"Signature verification could not read the subject "
+                    L"(CRYPT_E_FILE_ERROR): %ls", filePath.c_str());
+                break;
+
             default:
                 // Genuinely unrecognised. Still InvalidSignature, because an
                 // unknown trust status must never be optimistically trusted --
@@ -2284,6 +2337,7 @@ private:
         // only have failed. See the directory guard in VerifyFile for the field
         // measurement that produced this counter.
         std::atomic<uint64_t> unsignableTargetsRefused{0};
+        std::atomic<uint64_t> subjectUnreadable{0};
         std::atomic<uint64_t> blockedSigners{0};
         std::atomic<uint64_t> avgValidationTimeUs{0};
         std::atomic<uint64_t> stolenCertDetections{0};
@@ -2295,7 +2349,7 @@ private:
             unsignedFiles = 0; cacheHits = 0; cacheMisses = 0;
             revocationChecks = 0; revokedCertificates = 0; expiredCertificates = 0;
             revocationUndetermined = 0; unrecognisedTrustStatus = 0;
-            unsignableTargetsRefused = 0;
+            unsignableTargetsRefused = 0; subjectUnreadable = 0;
             blockedSigners = 0; avgValidationTimeUs = 0;
             stolenCertDetections = 0; anomalyDetections = 0;
             startTime = Clock::now();
@@ -2315,6 +2369,7 @@ private:
             s.revocationUndetermined = revocationUndetermined.load(std::memory_order_relaxed);
             s.unrecognisedTrustStatus = unrecognisedTrustStatus.load(std::memory_order_relaxed);
             s.unsignableTargetsRefused = unsignableTargetsRefused.load(std::memory_order_relaxed);
+            s.subjectUnreadable = subjectUnreadable.load(std::memory_order_relaxed);
             s.blockedSigners      = blockedSigners.load(std::memory_order_relaxed);
             s.avgValidationTimeUs = avgValidationTimeUs.load(std::memory_order_relaxed);
             s.stolenCertDetections = stolenCertDetections.load(std::memory_order_relaxed);

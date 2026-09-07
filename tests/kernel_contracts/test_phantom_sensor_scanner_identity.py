@@ -21081,5 +21081,122 @@ class CertificateVerdictAccountingContractTests(unittest.TestCase):
         )
 
 
+class UnreadableSubjectContractTests(unittest.TestCase):
+    """A file we could not read must not become evidence about that file.
+
+    CRYPT_E_FILE_ERROR means WinVerifyTrust never got to look at the subject.  It
+    used to fall into the switch's default arm and be recorded as
+    InvalidSignature, and that had a safety consequence rather than merely a
+    reporting one.  The chain, traced in the 1.0.111 field run:
+
+        InvalidSignature is not Error, so the result is CACHED
+          -> TryGetCachedMicrosoftSigned returns isValid && isMicrosoftSigned, FALSE
+            -> false is a DETERMINED answer, not an absent one
+              -> RealTimeProtection's guard against destroying a Microsoft-signed
+                 process on inference-class evidence takes its fall-through arm
+                 and permits the action.
+
+    141 files were affected in one six-minute run, including twelve Microsoft NGen
+    native images under C:\\Windows\\assembly and C:\\pagefile.sys.
+
+    These tests pin the CLASSIFICATION and its COUPLING TO THE CACHE together,
+    because either half alone is insufficient: a correct result that the cache
+    stores anyway is just as unsafe as a wrong result.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.cpp = read_source(DIGITAL_SIGNATURE_VALIDATOR_CPP_PATH)
+        cls.stripped = strip_c_comments(cls.cpp)
+
+    def _unreadable_case(self) -> str:
+        """The switch arm handling CRYPT_E_FILE_ERROR, up to its break."""
+        marker = self.stripped.find("case CRYPT_E_FILE_ERROR:")
+        self.assertGreater(
+            marker,
+            -1,
+            msg=(
+                "there is no explicit case for CRYPT_E_FILE_ERROR, so an unreadable "
+                "subject falls into the switch's default arm and is recorded as a "
+                "signature failure. A file that could not be read has not been "
+                "refuted"
+            ),
+        )
+        end = self.stripped.find("break;", marker)
+        self.assertGreater(end, marker, msg="the CRYPT_E_FILE_ERROR arm has no break")
+        return self.stripped[marker:end]
+
+    def test_an_unreadable_subject_is_not_reported_as_an_invalid_signature(self) -> None:
+        arm = self._unreadable_case()
+        for forbidden in ("InvalidSignature", "InvalidHash", "TamperedFile"):
+            self.assertNotIn(
+                forbidden,
+                arm,
+                msg=(
+                    f"the CRYPT_E_FILE_ERROR arm assigns {forbidden}. Nothing was "
+                    "verified and nothing was refuted, so no verdict about the "
+                    "file's signature may be recorded"
+                ),
+            )
+
+    def test_an_unreadable_subject_produces_a_result_the_cache_refuses(self) -> None:
+        """The safety invariant, and it spans two places on purpose.
+
+        Classifying the status correctly is worthless if the cache stores it
+        anyway: a stored answer is a DETERMINED answer, and determined-false is
+        exactly what switches the Microsoft-signed withhold guard off.
+        """
+        arm = self._unreadable_case()
+        self.assertIn(
+            "SignatureValidationResult::Error",
+            arm,
+            msg=(
+                "the CRYPT_E_FILE_ERROR arm does not produce Error. Only Error is "
+                "excluded from the result cache, and anything cached becomes a "
+                "determined answer that the Microsoft-signed withhold guard treats "
+                "as fact"
+            ),
+        )
+
+        # The other half of the invariant: the cache must still refuse Error.
+        writes = re.findall(
+            r"if\s*\(\s*useCache\s*&&\s*result\.result\s*!=\s*"
+            r"SignatureValidationResult::Error\s*\)",
+            self.stripped,
+        )
+        self.assertEqual(
+            1,
+            len(writes),
+            msg=(
+                "the result cache no longer excludes Error results, or its guard "
+                f"changed shape ({len(writes)} matches). If an Error is cached, an "
+                "unreadable subject becomes a determined 'not Microsoft-signed' and "
+                "the guard against destroying operating-system binaries on inference "
+                "stops withholding"
+            ),
+        )
+
+    def test_an_unreadable_subject_is_counted_apart_from_trust_decisions(self) -> None:
+        arm = self._unreadable_case()
+        self.assertIn(
+            "subjectUnreadable",
+            arm,
+            msg=(
+                "the CRYPT_E_FILE_ERROR arm does not count the read failure, so the "
+                "condition is invisible once the per-path log is below the "
+                "production threshold"
+            ),
+        )
+        self.assertNotIn(
+            "unrecognisedTrustStatus",
+            arm,
+            msg=(
+                "the CRYPT_E_FILE_ERROR arm increments unrecognisedTrustStatus. That "
+                "counter means 'WinVerifyTrust returned a status we do not triage'; "
+                "this status IS triaged, and pooling them hides both"
+            ),
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
