@@ -7121,6 +7121,43 @@ public:
     // THREAT HANDLING
     // =========================================================================
 
+    // THE WORD A USER NOTIFICATION USES MUST BE THE TRUTH ABOUT WHAT HAPPENED.
+    //
+    // The notification below asserted "Blocked:" unconditionally. ScanResult has
+    // carried `action` all along, so the outcome was known at this point and simply
+    // not consulted - and NONE is the commonest value, because the only two
+    // assignments of anything else in this translation unit are on paths that do not
+    // reach here. Both THREAT DETECTED events in the 1.0.111 field run were reported
+    // to the user as "Blocked" while nothing had been blocked; one of them was our own
+    // ShadowStrikePhantomUI.exe, flagged Heuristic:Win/Generic at risk 60.
+    //
+    // Telling someone their file was blocked when it was not is the kind of claim
+    // that makes every other message from the product untrustworthy, and it is worse
+    // than saying nothing: it invites them to believe a threat was contained.
+    //
+    // DELIBERATELY NOT DERIVED FROM remediationSuccessful. That field has NO PRODUCER
+    // anywhere in this translation unit - it is read once, at the line that mirrors it
+    // into the event, and never assigned - so it is permanently false. Wording any
+    // claim on it would have replaced one falsehood with another, reporting a failed
+    // remediation for every detection. Recorded as a separate defect rather than
+    // papered over here.
+    [[nodiscard]] static std::wstring_view RemediationOutcomeWord(
+        RemediationAction action) noexcept {
+        switch (action) {
+            case RemediationAction::NONE:               return L"Detected, no action taken";
+            case RemediationAction::BLOCKED:            return L"Blocked";
+            case RemediationAction::QUARANTINED:        return L"Quarantined";
+            case RemediationAction::DELETED:            return L"Deleted";
+            case RemediationAction::CLEANED:            return L"Cleaned";
+            case RemediationAction::PROCESS_TERMINATED: return L"Process terminated";
+            case RemediationAction::NETWORK_BLOCKED:    return L"Network connection blocked";
+            case RemediationAction::REGISTRY_RESTORED:  return L"Registry restored";
+            case RemediationAction::ROLLBACK:           return L"Rolled back";
+        }
+        // A value outside the enumeration must not be described as an action taken.
+        return L"Detected";
+    }
+
     void HandleThreatDetection(const ScanResult& result, const std::wstring& filePath, uint32_t pid) {
         // Create threat event
         ThreatEvent event;
@@ -7173,17 +7210,25 @@ public:
             } catch (...) {}
         }
 
-        // User notification
+        // User notification. The outcome is stated, not assumed.
         if (m_config.notifyOnThreat) {
+            const std::wstring_view outcome = RemediationOutcomeWord(result.action);
             NotifyUser(NotificationSeverity::THREAT_DETECTED,
                 L"Threat Detected",
-                std::format(L"Blocked: {} in {}", result.threatName, filePath),
+                std::format(L"{}: {} in {}", outcome, result.threatName, filePath),
                 event);
         }
 
-        Utils::Logger::Warn("RealTimeProtection: THREAT DETECTED - {} in {} (PID: {})",
+        // The log line carries the same outcome for the same reason. A field log that
+        // says THREAT DETECTED with no statement of what was done about it cannot be
+        // used to tell a contained threat from an uncontained one, which is the first
+        // question anyone reading it has.
+        Utils::Logger::Warn(
+            "RealTimeProtection: THREAT DETECTED - {} in {} (PID: {}) - outcome: {}",
             Utils::StringUtils::ToNarrow(result.threatName),
-            Utils::StringUtils::ToNarrow(filePath), pid);
+            Utils::StringUtils::ToNarrow(filePath), pid,
+            Utils::StringUtils::ToNarrow(std::wstring(
+                RemediationOutcomeWord(result.action))));
     }
 
     void NotifyUser(NotificationSeverity severity, std::wstring_view title,

@@ -21198,5 +21198,159 @@ class UnreadableSubjectContractTests(unittest.TestCase):
         )
 
 
+class ThreatOutcomeHonestyContractTests(unittest.TestCase):
+    """A notification must not claim an action the product did not take.
+
+    The user-facing threat notification asserted "Blocked:" unconditionally, while
+    ScanResult had carried the real `action` all along.  Both THREAT DETECTED
+    events in the 1.0.111 field run were reported as blocked when nothing had been
+    blocked, and one of them was our own ShadowStrikePhantomUI.exe flagged
+    Heuristic:Win/Generic.
+
+    Telling someone a threat was contained when it was not is worse than saying
+    nothing, because it invites them to stop worrying about it.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.cpp = read_source(REAL_TIME_PROTECTION_CPP_PATH)
+        cls.stripped = strip_c_comments(cls.cpp)
+        cls.hpp = read_source(REAL_TIME_PROTECTION_HPP_PATH)
+
+    def _outcome_helper(self) -> str:
+        match = re.search(
+            r"std::wstring_view\s+RemediationOutcomeWord\s*\([^)]*\)\s*noexcept\s*\{",
+            self.stripped,
+        )
+        self.assertIsNotNone(
+            match,
+            msg=(
+                "there is no RemediationOutcomeWord helper, so the notification has "
+                "no way to state what actually happened"
+            ),
+        )
+        brace = self.stripped.index("{", match.end() - 1)
+        return self.stripped[brace:_matching_delimiter(self.stripped, brace, "{", "}")]
+
+    @staticmethod
+    def _remediation_enumerators(header_text: str) -> list[str]:
+        """Derived from the enum, so a value added later is covered automatically."""
+        match = re.search(
+            r"enum class RemediationAction\s*:\s*uint8_t\s*\{", header_text
+        )
+        if match is None:
+            raise AssertionError("RemediationAction is no longer declared in the header")
+        brace = match.end() - 1
+        body = header_text[brace:_matching_delimiter(header_text, brace, "{", "}")]
+        return re.findall(r"^\s*([A-Z][A-Z_]*)\s*(?:=|,)", body, re.M)
+
+    def test_the_threat_notification_states_the_actual_outcome(self) -> None:
+        gate = self.stripped.find("if (m_config.notifyOnThreat)")
+        self.assertGreater(
+            gate, -1, msg="the threat notification gate is no longer present"
+        )
+        brace = self.stripped.index("{", gate)
+        statement = self.stripped[brace:_matching_delimiter(self.stripped, brace, "{", "}")]
+        self.assertIn(
+            "NotificationSeverity::THREAT_DETECTED",
+            statement,
+            msg="the notification block no longer raises a threat notification",
+        )
+
+        self.assertIn(
+            "RemediationOutcomeWord",
+            statement,
+            msg=(
+                "the threat notification does not derive its wording from the "
+                "remediation action, so it is asserting an outcome rather than "
+                "reporting one"
+            ),
+        )
+        for hardcoded in ('"Blocked:', '"Quarantined:', '"Deleted:', '"Removed:'):
+            self.assertNotIn(
+                hardcoded,
+                statement,
+                msg=(
+                    f"the threat notification hardcodes {hardcoded!r}. The action "
+                    "taken is recorded in ScanResult::action and must be read from "
+                    "there; asserting it is how the field run told a user their file "
+                    "was blocked when nothing had been"
+                ),
+            )
+
+    def test_every_remediation_action_has_an_outcome_word(self) -> None:
+        """A value added to the enum must not silently become a generic word.
+
+        The subject list comes from the enum rather than from this file, so the
+        next author to add an action is covered without touching the test - and
+        will be told about it by a failure rather than by a vague notification in
+        the field.
+        """
+        enumerators = self._remediation_enumerators(self.hpp)
+        self.assertGreaterEqual(
+            len(enumerators),
+            8,
+            msg=(
+                f"only {len(enumerators)} RemediationAction values parsed; this test "
+                "proves nothing if the enum stopped parsing"
+            ),
+        )
+        body = self._outcome_helper()
+        missing = [
+            name
+            for name in enumerators
+            if not re.search(r"case\s+RemediationAction::" + re.escape(name) + r"\s*:", body)
+        ]
+        self.assertEqual(
+            [],
+            missing,
+            msg=(
+                "these remediation actions have no outcome word, so a user would be "
+                f"told only 'Detected' after one of them was performed: {missing}"
+            ),
+        )
+
+    def test_the_outcome_word_is_not_derived_from_a_field_with_no_producer(self) -> None:
+        """remediationSuccessful is never assigned; wording on it would be a new lie.
+
+        Anti-vacuity is the interesting half here: the test asserts BOTH that the
+        helper ignores the field AND that the field still has no producer.  If
+        somebody gives it one, this test fails and the wording SHOULD then be
+        revisited - which is the outcome we want, rather than a silent stale
+        assumption.
+        """
+        # Reported per offending line rather than with assertNotIn, which would print
+        # the whole helper body - and the one line that matters is the message.
+        body = self._outcome_helper()
+        offenders = [
+            line.strip()[:80]
+            for line in body.splitlines()
+            if "remediationSuccessful" in line
+        ]
+        self.assertEqual(
+            [],
+            offenders,
+            msg=(
+                "the outcome word is derived from remediationSuccessful, which has "
+                "no producer and is therefore permanently false. That would report a "
+                f"failed remediation for every single detection: {offenders}"
+            ),
+        )
+
+        assignments = re.findall(
+            r"remediationSuccessful\s*=(?!=)", self.stripped
+        )
+        self.assertEqual(
+            [],
+            assignments,
+            msg=(
+                "remediationSuccessful now HAS a producer "
+                f"({len(assignments)} assignment(s)). That is good news, and it means "
+                "the outcome wording should now distinguish a successful remediation "
+                "from a failed one instead of reporting only what was attempted"
+            ),
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
