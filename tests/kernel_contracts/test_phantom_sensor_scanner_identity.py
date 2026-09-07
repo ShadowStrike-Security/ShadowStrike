@@ -21670,5 +21670,220 @@ class KernelDenialAccountingContractTests(unittest.TestCase):
         )
 
 
+class KernelTrustHookContractTests(unittest.TestCase):
+    """The kernel hooks must ask a question the answering component can answer.
+
+    CertificateValidator::OnKernelImageLoad and ::OnKernelProcessCreate passed a PE
+    image path to CertificateValidator's own VerifyFile, which parses a RAW X.509
+    certificate - DER or PEM.  A PE begins with "MZ", so the parse failed on the first
+    byte and the verdict was ValidationResult::Error on every call.  The Revoked and
+    UntrustedRoot refusals both functions contained had therefore never fired once.
+
+    The 1.0.111 field run measured it across both hooks: 904 validations, 0 valid,
+    0 revoked, 0 CRL checks, 0 OCSP checks, and avgValidationTimeUs of 0 - the last
+    being the proof, because that average updates at the END of the funnel.
+
+    Meanwhile DigitalSignatureValidator performed 1,351 whole-chain revocation checks
+    in the same run.  The capability was in the product; these hooks simply asked the
+    wrong component, while their own comments said which one was right.
+
+    They now read the cached Authenticode verdict.  It has to be the CACHE: these run
+    on the thread the kernel waits on under a 400 ms reply horizon, and that field run
+    put determine-microsoft-trust at a 614 ms p99 and an 8,078 ms maximum.  Verifying
+    in line could not meet the horizon on average, and a missed reply fails open, so
+    it would cost detection rather than buy it.
+    """
+
+    _HOOKS = ("OnKernelImageLoad", "OnKernelProcessCreate")
+    # Every one of these reaches WinVerifyTrust or a file read. None may appear on a
+    # thread that is holding a kernel operation open.
+    _BLOCKING_VERIFIERS = (
+        "m_impl->VerifyFile",
+        "IsMicrosoftSigned(",
+        "ValidateProcessImage(",
+        "AnalyzeSignature(",
+        "verifyWithWinTrust(",
+    )
+    _CACHE_ONLY = "TryGetCachedSignatureResult"
+
+    @classmethod
+    def _hook_body(cls, source: str, hook: str) -> str:
+        """Slice a member function by its QUALIFIED definition, brace-matched.
+
+        Not extract_c_function: these are qualified member definitions
+        (`void CertificateValidator::OnKernelImageLoad(`), and the unqualified name
+        also appears at the declaration and in log strings, so the definition is
+        located explicitly and asserted unique before any offset is used.
+        """
+        pattern = r"^void CertificateValidator::" + re.escape(hook) + r"\("
+        hits = list(re.finditer(pattern, source, re.M))
+        if len(hits) != 1:
+            raise AssertionError(
+                f"expected exactly one definition of {hook}, found {len(hits)}"
+            )
+        start = hits[0].start()
+        open_brace = source.index("{", start)
+        depth = 0
+        for i in range(open_brace, len(source)):
+            if source[i] == "{":
+                depth += 1
+            elif source[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[start:i + 1]
+        raise AssertionError(f"unbalanced braces in {hook}")
+
+    def test_kernel_hooks_do_not_call_a_raw_certificate_parser(self) -> None:
+        """The defect itself, in its general form.
+
+        Subjects are both hooks, and the forbidden list is every entry point that
+        reads a file or reaches WinVerifyTrust - not just the one that was wrong.
+        """
+        source = strip_c_comments(read_source(CERTIFICATE_VALIDATOR_CPP_PATH))
+        offenders: list[str] = []
+        for hook in self._HOOKS:
+            body = self._hook_body(source, hook)
+            for verifier in self._BLOCKING_VERIFIERS:
+                if verifier in body:
+                    offenders.append(f"{hook} calls {verifier}")
+
+        self.assertEqual(
+            [],
+            offenders,
+            msg=(
+                "a kernel hook calls a verifier that reads a file or reaches "
+                "WinVerifyTrust. It runs on the thread the kernel waits on under a "
+                "400 ms reply horizon, and the field measured that verification at a "
+                "614 ms p99 and an 8,078 ms maximum - it cannot answer in time, and a "
+                f"missed reply fails open: {offenders}"
+            ),
+        )
+
+    def test_kernel_hooks_consult_the_cache_only_verdict_accessor(self) -> None:
+        """Anti-vacuity for the test above, which deletion alone would satisfy.
+
+        Removing the verifier call entirely would leave that test passing and this
+        product blind, so the hooks are also required to actually ask something.
+        """
+        source = strip_c_comments(read_source(CERTIFICATE_VALIDATOR_CPP_PATH))
+        for hook in self._HOOKS:
+            body = self._hook_body(source, hook)
+            self.assertGreater(
+                body.count(self._CACHE_ONLY),
+                0,
+                msg=(
+                    f"{hook} consults no Authenticode verdict at all. Asking nothing "
+                    "satisfies the no-blocking-verifier rule while giving up the "
+                    "detection entirely"
+                ),
+            )
+
+    def test_an_undetermined_verdict_cannot_reach_a_refusal(self) -> None:
+        """Ordering, not presence.
+
+        nullopt means nobody established anything about this image. If that case
+        reached the refusal it would be refusing on absent evidence, which is the
+        inverse of the CRYPT_E_FILE_ERROR defect fixed earlier: there a file we could
+        not read became evidence against itself.
+        """
+        source = strip_c_comments(read_source(CERTIFICATE_VALIDATOR_CPP_PATH))
+        for hook in self._HOOKS:
+            body = self._hook_body(source, hook)
+            guard = body.find("has_value()")
+            refusal = body.find("RequestKernelProcessBlock")
+            self.assertGreater(
+                guard, -1, msg=f"{hook} does not test whether a verdict was determined"
+            )
+            self.assertGreater(
+                refusal, -1, msg=f"{hook} issues no refusal"
+            )
+            self.assertLess(
+                guard,
+                refusal,
+                msg=(
+                    f"in {hook} the undetermined-verdict check does not precede the "
+                    "refusal, so an image nobody has examined could be refused on "
+                    "absent evidence"
+                ),
+            )
+
+    def test_the_cached_verdict_accessor_performs_no_verification(self) -> None:
+        """The accessor is the load-bearing part of the performance claim.
+
+        If it ever verifies on a miss, every caller inherits a blocking call onto a
+        thread that must not have one - and the callers would not change, so this is
+        the only place that can catch it.
+        """
+        source = strip_c_comments(read_source(DIGITAL_SIGNATURE_VALIDATOR_CPP_PATH))
+        marker = source.find("TryGetCachedSignatureResult(")
+        self.assertGreater(
+            marker, -1, msg="the cache-only verdict accessor is gone"
+        )
+        open_brace = source.index("{", marker)
+        depth = 0
+        end = open_brace
+        for i in range(open_brace, len(source)):
+            if source[i] == "{":
+                depth += 1
+            elif source[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        body = source[marker:end]
+
+        self.assertGreater(
+            body.count("getCachedResult"),
+            0,
+            msg="the accessor no longer reads the cache",
+        )
+        for forbidden in ("VerifyFile", "verifyWithWinTrust", "WinVerifyTrust"):
+            self.assertEqual(
+                0,
+                body.count(forbidden),
+                msg=(
+                    f"the cache-only accessor calls {forbidden}. Its entire purpose is "
+                    "to answer without verifying, because its callers hold kernel "
+                    "operations open"
+                ),
+            )
+
+    def test_process_creation_is_refused_on_revocation_only(self) -> None:
+        """A deliberate narrowing, pinned with its reason.
+
+        Refusing a process creation is the most disruptive act available to this
+        product. UntrustedRoot is acted on for a module load, where the blast radius
+        is one library in one process, but an unfamiliar root is ordinary on developer
+        and enterprise machines and must not stop a program from starting.
+        """
+        source = strip_c_comments(read_source(CERTIFICATE_VALIDATOR_CPP_PATH))
+        create = self._hook_body(source, "OnKernelProcessCreate")
+        load = self._hook_body(source, "OnKernelImageLoad")
+
+        self.assertGreater(
+            create.count("SignatureValidationResult::Revoked"),
+            0,
+            msg="process creation no longer refuses on a revoked certificate",
+        )
+        self.assertEqual(
+            0,
+            create.count("SignatureValidationResult::UntrustedRoot"),
+            msg=(
+                "process creation refuses on UntrustedRoot. An unfamiliar root is "
+                "ordinary on developer and enterprise machines; refusing every such "
+                "program from starting would be a denial of service against the user's "
+                "own computer"
+            ),
+        )
+        self.assertGreater(
+            load.count("SignatureValidationResult::UntrustedRoot"),
+            0,
+            msg=(
+                "the image-load hook no longer refuses on UntrustedRoot, where the "
+                "narrowing above does not apply"
+            ),
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -41,6 +41,7 @@
 
 #include "pch.h"
 #include "CertificateValidator.hpp"
+#include "DigitalSignatureValidator.hpp"
 
 // ============================================================================
 // WINDOWS CRYPTO SDK
@@ -566,6 +567,9 @@ void CertificateValidatorStatistics::Reset() noexcept {
     validationCacheHits = 0;
     chainBuildFailures = 0;
     nonCertificateInputs = 0;
+    kernelVerdictAlreadyKnown = 0;
+    kernelVerdictUndetermined = 0;
+    kernelRevocationBlocks = 0;
     avgValidationTimeUs = 0;
     startTime = Clock::now();
 }
@@ -588,6 +592,9 @@ void CertificateValidatorStatistics::Reset() noexcept {
     oss << "\"validationCacheHits\":" << validationCacheHits << ",";
     oss << "\"chainBuildFailures\":" << chainBuildFailures << ",";
     oss << "\"nonCertificateInputs\":" << nonCertificateInputs << ",";
+    oss << "\"kernelVerdictAlreadyKnown\":" << kernelVerdictAlreadyKnown << ",";
+    oss << "\"kernelVerdictUndetermined\":" << kernelVerdictUndetermined << ",";
+    oss << "\"kernelRevocationBlocks\":" << kernelRevocationBlocks << ",";
     oss << "\"avgValidationTimeUs\":" << avgValidationTimeUs << ",";
     oss << "\"uptimeMs\":" << uptimeMs;
     oss << "}";
@@ -725,6 +732,9 @@ struct InternalAtomicStats {
     std::atomic<uint64_t> validationCacheHits{0};
     std::atomic<uint64_t> chainBuildFailures{0};
     std::atomic<uint64_t> nonCertificateInputs{0};
+    std::atomic<uint64_t> kernelVerdictAlreadyKnown{0};
+    std::atomic<uint64_t> kernelVerdictUndetermined{0};
+    std::atomic<uint64_t> kernelRevocationBlocks{0};
     std::atomic<uint64_t> avgValidationTimeUs{0};
     TimePoint startTime = Clock::now();
 
@@ -741,6 +751,9 @@ struct InternalAtomicStats {
         validationCacheHits.store(0, std::memory_order_relaxed);
         chainBuildFailures.store(0, std::memory_order_relaxed);
         nonCertificateInputs.store(0, std::memory_order_relaxed);
+        kernelVerdictAlreadyKnown.store(0, std::memory_order_relaxed);
+        kernelVerdictUndetermined.store(0, std::memory_order_relaxed);
+        kernelRevocationBlocks.store(0, std::memory_order_relaxed);
         avgValidationTimeUs.store(0, std::memory_order_relaxed);
         startTime = Clock::now();
     }
@@ -759,6 +772,12 @@ struct InternalAtomicStats {
         snap.validationCacheHits = validationCacheHits.load(std::memory_order_relaxed);
         snap.chainBuildFailures  = chainBuildFailures.load(std::memory_order_relaxed);
         snap.nonCertificateInputs = nonCertificateInputs.load(std::memory_order_relaxed);
+        snap.kernelVerdictAlreadyKnown =
+            kernelVerdictAlreadyKnown.load(std::memory_order_relaxed);
+        snap.kernelVerdictUndetermined =
+            kernelVerdictUndetermined.load(std::memory_order_relaxed);
+        snap.kernelRevocationBlocks =
+            kernelRevocationBlocks.load(std::memory_order_relaxed);
         snap.avgValidationTimeUs = avgValidationTimeUs.load(std::memory_order_relaxed);
         snap.startTime           = startTime;
         return snap;
@@ -1565,6 +1584,18 @@ public:
     }
 
     /// @brief Submit a fire-and-forget task to the async pool (for telemetry offload)
+    // The kernel hooks live on CertificateValidator, not on this Impl, so they reach
+    // the counters the same way they reach everything else here.
+    void RecordKernelVerdictKnown() noexcept {
+        m_stats.kernelVerdictAlreadyKnown.fetch_add(1, std::memory_order_relaxed);
+    }
+    void RecordKernelVerdictUndetermined() noexcept {
+        m_stats.kernelVerdictUndetermined.fetch_add(1, std::memory_order_relaxed);
+    }
+    void RecordKernelRevocationBlock() noexcept {
+        m_stats.kernelRevocationBlocks.fetch_add(1, std::memory_order_relaxed);
+    }
+
     [[nodiscard]] bool SubmitAsync(std::function<void()> task) {
         return m_asyncPool.Submit(std::move(task));
     }
@@ -3468,44 +3499,93 @@ void CertificateValidator::OnKernelImageLoad(
         std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
         if (ext != L".exe" && ext != L".dll" && ext != L".sys") return;
 
-        // Use CacheResult flag so repeat loads resolve from in-memory cache.
-        // VerifyFile reads the Authenticode signature and checks the cache internally.
+        // WHY THIS ASKS A DIFFERENT COMPONENT THAN IT USED TO.
         //
-        // OfflineOnly is stated EXPLICITLY rather than relied upon from the default.
-        // This function is called from RealTimeProtection::OnKernelImageLoad and, as
-        // the block below says, has to decide before the kernel is released. A
-        // synchronous CRL or OCSP fetch here would be a network round trip taken on
-        // every module load in every process. Saying it here means a future change
-        // to the ValidationOptions default cannot quietly reintroduce that.
-        // Revocation is still evaluated against the local CRL cache, so the Revoked
-        // verdict this function acts on is still reached for anything already known.
-        ValidationOptions opts;
-        opts.flags = opts.flags | CertificateValidationFlags::CacheResult
-                                | CertificateValidationFlags::OfflineOnly;
-        auto details = m_impl->VerifyFile(path, opts);
+        // This function used to call CertificateValidator's own VerifyFile with the
+        // image path.  That function parses a RAW X.509 certificate - DER or PEM.  A
+        // PE image begins with "MZ", so the encoding sniffer returned Unknown, the
+        // parse returned nullopt, and the verdict was ValidationResult::Error on
+        // EVERY call without exception.  The revocation test below could therefore
+        // never be true, and the refusal it guards had never once fired.
+        //
+        // MEASURED IN THE 1.0.111 FIELD RUN, across both kernel hooks:
+        //     totalValidations 904   validCertificates 0   revokedCertificates 0
+        //     crlChecks 0            ocspChecks 0          chainBuildFailures 0
+        //     avgValidationTimeUs 0
+        // The last figure is the proof rather than a symptom: that average updates at
+        // the END of the validation funnel, so a zero average means no call ever
+        // reached it.  904 file reads produced 904 early returns.
+        //
+        // Authenticode for a PE is DigitalSignatureValidator's job, which the old
+        // code's own comment stated out loud while continuing to ask the wrong
+        // component anyway.  That validator runs WinVerifyTrust with
+        // WTD_REVOKE_WHOLECHAIN against the local CRL cache; the same field run
+        // recorded 1,351 revocation checks through it.  The capability was present in
+        // the product and simply never consulted here.
+        //
+        // THE CACHE, NOT THE VERIFIER.  This runs on the thread the kernel is waiting
+        // on, under a 400 ms reply horizon (kProcessNotifyReplyHorizonMs).  The same
+        // run measured determine-microsoft-trust at a 614 ms p99 and an 8,078 ms
+        // maximum, so verifying in line could not meet that horizon even on average -
+        // and a missed reply fails open, so it would cost detection rather than buy
+        // it.  A cache read costs a hash lookup and a last-write-time check, and the
+        // verdict it returns was produced at full strength on a thread that held
+        // nothing.
+        //
+        // AN ABSENT VERDICT IS NOT AN ACQUITTAL.  nullopt means nobody has
+        // established anything about this image yet, so there is nothing to act on
+        // and nothing is done.  That case is counted, because how often it happens
+        // decides whether the cold path needs an answer of its own, and that should
+        // be settled with a number rather than an opinion.
+        if (!DigitalSignatureValidator::HasInstance()) return;
+        const auto cachedVerdict =
+            DigitalSignatureValidator::Instance().TryGetCachedSignatureResult(path);
 
-        // For revoked / untrusted certs, block synchronously BEFORE returning to kernel
-        if (!details.IsValid() &&
-            (details.result == ValidationResult::Revoked ||
-             details.result == ValidationResult::UntrustedRoot)) {
-            (void)RequestKernelProcessBlock(processId,
-                "Certificate validation failed: " +
-                std::string(GetValidationResultName(details.result)));
+        if (!cachedVerdict.has_value()) {
+            m_impl->RecordKernelVerdictUndetermined();
+            return;
         }
+        m_impl->RecordKernelVerdictKnown();
 
-        // Suppress alert/telemetry flood for inputs that VerifyFile could not
-        // parse as a raw certificate (e.g., signed PE binaries — Authenticode
-        // verification is handled by a different pipeline). Treat
-        // ValidationResult::Error here as "inapplicable", not "malicious".
-        if (details.result == ValidationResult::Error) {
-            SS_LOG_DEBUG(LOG_CATEGORY,
-                L"OnKernelImageLoad: VerifyFile returned Error (non-cert input), "
-                L"suppressing alert path for PID %u", processId);
+        // Revoked or untrusted-root only: refuse before the kernel is released.
+        //
+        // Unsigned is deliberately NOT grounds to refuse a module load - it describes
+        // an enormous share of ordinary software, and acting on it would make this a
+        // denial of service against the user's own machine. These two verdicts mean a
+        // certificate authority or the OS affirmatively withdrew trust, which is
+        // evidence rather than the absence of it.
+        if (*cachedVerdict != SignatureValidationResult::Revoked &&
+            *cachedVerdict != SignatureValidationResult::UntrustedRoot) {
             return;
         }
 
-        // Pre-compute data needed by async helpers (no `this` capture — safe from UAF)
-        auto detailsCopy = std::make_shared<ValidationDetails>(std::move(details));
+        m_impl->RecordKernelRevocationBlock();
+        SS_LOG_WARN(LOG_CATEGORY,
+            L"Refusing image load into PID %u: Authenticode verdict is %hs: %ls",
+            processId,
+            std::string(GetSignatureResultName(*cachedVerdict)).c_str(),
+            path.c_str());
+        (void)RequestKernelProcessBlock(processId,
+            "Image certificate " +
+            std::string(GetSignatureResultName(*cachedVerdict)) + ": " +
+            Utils::StringUtils::ToNarrow(path));
+
+        // Telemetry and the alert now describe a REFUSAL, not a parse failure.
+        //
+        // What stood here emitted both for every input whose ValidationDetails came
+        // back Error - which was every input, since none could be parsed - so the
+        // alert stream reported a caller mistake as a cryptographic finding on every
+        // module load. Reaching this point now means the product actually refused
+        // something, which is worth an alert every time and is far rarer.
+        // Mapped rather than reconstructed. Only the verdict crosses over; subject,
+        // issuer, serial and chain stay empty because no X.509 parse produced them,
+        // and filling them in to satisfy a telemetry shape would be fabrication.
+        ValidationDetails refusal{};
+        refusal.result = (*cachedVerdict == SignatureValidationResult::Revoked)
+            ? ValidationResult::Revoked
+            : ValidationResult::UntrustedRoot;
+
+        auto detailsCopy = std::make_shared<ValidationDetails>(std::move(refusal));
         auto pid = processId;
         auto narrowPath = std::make_shared<std::string>(
             Utils::StringUtils::ToNarrow(imagePath));
@@ -3515,14 +3595,9 @@ void CertificateValidator::OnKernelImageLoad(
         (void)m_impl->SubmitAsync([detailsCopy, pid, narrowPath, ver, statsSnap]() {
             EmitCertTelemetryStatic(*detailsCopy, *narrowPath, ver,
                 statsSnap.totalValidations, statsSnap.avgValidationTimeUs);
-            if (!detailsCopy->IsValid()) {
-                SS_LOG_WARN(L"CertificateValidator",
-                    L"Invalid code-signing cert on image loaded by PID %u: %hs — result=%hs",
-                    pid, narrowPath->c_str(),
-                    std::string(GetValidationResultName(detailsCopy->result)).c_str());
-                EmitCertAlertStatic(*detailsCopy,
-                    "ImageLoad PID=" + std::to_string(pid) + " " + *narrowPath, ver);
-            }
+            EmitCertAlertStatic(*detailsCopy,
+                "ImageLoad REFUSED PID=" + std::to_string(pid) + " " + *narrowPath,
+                ver);
         });
 
     } catch (const std::exception& e) {
@@ -3542,34 +3617,83 @@ void CertificateValidator::OnKernelProcessCreate(
         std::wstring path(imagePath);
         if (path.empty()) return;
 
-        // OfflineOnly stated explicitly for the same reason as OnKernelImageLoad:
-        // this runs from RealTimeProtection::OnKernelProcessNotify and blocks
-        // synchronously below, so it must never take a network round trip while the
-        // kernel is waiting on a process creation. Local CRL cache still applies, so
-        // an already-known-revoked certificate is still caught and still blocked.
-        ValidationOptions opts;
-        opts.flags = opts.flags | CertificateValidationFlags::CacheResult
-                                | CertificateValidationFlags::OfflineOnly;
-        auto details = m_impl->VerifyFile(path, opts);
+        // WHY THIS ASKS A DIFFERENT COMPONENT THAN IT USED TO.
+        //
+        // This function used to call CertificateValidator's own VerifyFile with the
+        // image path.  That function parses a RAW X.509 certificate - DER or PEM.  A
+        // PE image begins with "MZ", so the encoding sniffer returned Unknown, the
+        // parse returned nullopt, and the verdict was ValidationResult::Error on
+        // EVERY call without exception.  The revocation test below could therefore
+        // never be true, and the refusal it guards had never once fired.
+        //
+        // MEASURED IN THE 1.0.111 FIELD RUN, across both kernel hooks:
+        //     totalValidations 904   validCertificates 0   revokedCertificates 0
+        //     crlChecks 0            ocspChecks 0          chainBuildFailures 0
+        //     avgValidationTimeUs 0
+        // The last figure is the proof rather than a symptom: that average updates at
+        // the END of the validation funnel, so a zero average means no call ever
+        // reached it.  904 file reads produced 904 early returns.
+        //
+        // Authenticode for a PE is DigitalSignatureValidator's job, which the old
+        // code's own comment stated out loud while continuing to ask the wrong
+        // component anyway.  That validator runs WinVerifyTrust with
+        // WTD_REVOKE_WHOLECHAIN against the local CRL cache; the same field run
+        // recorded 1,351 revocation checks through it.  The capability was present in
+        // the product and simply never consulted here.
+        //
+        // THE CACHE, NOT THE VERIFIER.  This runs on the thread the kernel is waiting
+        // on, under a 400 ms reply horizon (kProcessNotifyReplyHorizonMs).  The same
+        // run measured determine-microsoft-trust at a 614 ms p99 and an 8,078 ms
+        // maximum, so verifying in line could not meet that horizon even on average -
+        // and a missed reply fails open, so it would cost detection rather than buy
+        // it.  A cache read costs a hash lookup and a last-write-time check, and the
+        // verdict it returns was produced at full strength on a thread that held
+        // nothing.
+        //
+        // AN ABSENT VERDICT IS NOT AN ACQUITTAL.  nullopt means nobody has
+        // established anything about this image yet, so there is nothing to act on
+        // and nothing is done.  That case is counted, because how often it happens
+        // decides whether the cold path needs an answer of its own, and that should
+        // be settled with a number rather than an opinion.
+        if (!DigitalSignatureValidator::HasInstance()) return;
+        const auto cachedVerdict =
+            DigitalSignatureValidator::Instance().TryGetCachedSignatureResult(path);
 
-        // Synchronous block for revoked certs — must happen before kernel returns
-        if (!details.IsValid() && details.result == ValidationResult::Revoked) {
-            std::string narrowPath = Utils::StringUtils::ToNarrow(imagePath);
-            (void)RequestKernelProcessBlock(processId,
-                "Process certificate revoked: " + narrowPath);
+        if (!cachedVerdict.has_value()) {
+            m_impl->RecordKernelVerdictUndetermined();
+            return;
         }
+        m_impl->RecordKernelVerdictKnown();
 
-        // Same suppression as OnKernelImageLoad: skip alert/telemetry when
-        // VerifyFile returned Error (file is not a parseable raw certificate).
-        if (details.result == ValidationResult::Error) {
-            SS_LOG_DEBUG(LOG_CATEGORY,
-                L"OnKernelProcessCreate: VerifyFile returned Error (non-cert input), "
-                L"suppressing alert path for PID %u", processId);
+        // Revoked ONLY, deliberately narrower than the image-load hook above.
+        //
+        // Refusing a process creation is the most disruptive thing this product can do
+        // to a working machine, so it is reserved for the verdict that means a
+        // certificate authority withdrew trust in the signer. UntrustedRoot is acted
+        // on for a module load, where the blast radius is one library in one process,
+        // but not here: an unfamiliar root is ordinary on developer and enterprise
+        // machines and must not stop a program from starting.
+        if (*cachedVerdict != SignatureValidationResult::Revoked) {
             return;
         }
 
-        // Pre-compute data for async helpers (no `this` capture — safe from UAF)
-        auto detailsCopy = std::make_shared<ValidationDetails>(std::move(details));
+        m_impl->RecordKernelRevocationBlock();
+        SS_LOG_WARN(LOG_CATEGORY,
+            L"Refusing process creation PID %u (PPID %u): certificate revoked: %ls",
+            processId, parentProcessId, path.c_str());
+        (void)RequestKernelProcessBlock(processId,
+            "Process certificate revoked: " +
+            Utils::StringUtils::ToNarrow(imagePath));
+
+        // As in OnKernelImageLoad: reaching this point means the product refused a
+        // process creation, so the alert is unconditional and describes a refusal.
+        // Mapped rather than reconstructed. Only the verdict crosses over; subject,
+        // issuer, serial and chain stay empty because no X.509 parse produced them,
+        // and filling them in to satisfy a telemetry shape would be fabrication.
+        ValidationDetails refusal{};
+        refusal.result = ValidationResult::Revoked;
+
+        auto detailsCopy = std::make_shared<ValidationDetails>(std::move(refusal));
         auto pid = processId;
         auto ppid = parentProcessId;
         auto narrowPath = std::make_shared<std::string>(
@@ -3578,17 +3702,11 @@ void CertificateValidator::OnKernelProcessCreate(
         auto statsSnap = GetStatistics();
 
         (void)m_impl->SubmitAsync([detailsCopy, pid, ppid, narrowPath, ver, statsSnap]() {
-            std::string ctx = "ProcessCreate PID=" + std::to_string(pid) +
+            std::string ctx = "ProcessCreate REFUSED PID=" + std::to_string(pid) +
                 " PPID=" + std::to_string(ppid);
             EmitCertTelemetryStatic(*detailsCopy, ctx, ver,
                 statsSnap.totalValidations, statsSnap.avgValidationTimeUs);
-            if (!detailsCopy->IsValid()) {
-                SS_LOG_WARN(L"CertificateValidator",
-                    L"New process PID %u (PPID %u) has invalid certificate: %hs — %hs",
-                    pid, ppid, narrowPath->c_str(),
-                    std::string(GetValidationResultName(detailsCopy->result)).c_str());
-                EmitCertAlertStatic(*detailsCopy, ctx + " " + *narrowPath, ver);
-            }
+            EmitCertAlertStatic(*detailsCopy, ctx + " " + *narrowPath, ver);
         });
 
     } catch (const std::exception& e) {

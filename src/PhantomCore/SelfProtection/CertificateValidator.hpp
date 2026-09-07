@@ -897,6 +897,27 @@ struct CertificateValidatorStatistics {
     /// certificates", which is the difference between a broken trust stack and a
     /// caller handing a PE image to a raw X.509 parser.
     uint64_t nonCertificateInputs{0};
+
+    /// @brief Kernel hooks that found an Authenticode verdict already established.
+    ///
+    /// OnKernelImageLoad and OnKernelProcessCreate read a cached verdict instead of
+    /// verifying in line, because they run on the thread the kernel is waiting on.
+    /// This is how often that read succeeded.
+    uint64_t kernelVerdictAlreadyKnown{0};
+
+    /// @brief Kernel hooks that found no verdict, and therefore did nothing.
+    ///
+    /// Counted rather than inferred, because its ratio against the field above is the
+    /// measurement that decides whether the cold path needs an answer of its own.  An
+    /// absent verdict is not an acquittal, so the only correct action is none.
+    uint64_t kernelVerdictUndetermined{0};
+
+    /// @brief Refusals issued on a revoked or untrusted-root Authenticode verdict.
+    ///
+    /// Structurally zero for the whole life of the product before these hooks were
+    /// pointed at a pipeline that can produce those verdicts.  Non-zero here is the
+    /// observable that the capability is live.
+    uint64_t kernelRevocationBlocks{0};
     
     /// @brief Average validation time (microseconds) — exponential moving average
     uint64_t avgValidationTimeUs{0};

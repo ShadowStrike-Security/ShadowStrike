@@ -994,6 +994,29 @@ public:
      */
     [[nodiscard]] std::optional<bool> TryGetCachedMicrosoftSigned(
         std::wstring_view filePath) const;
+
+    /**
+     * @brief Answer "what is this file's signature verdict?" only if the answer is
+     *        already known, without performing any verification.
+     *
+     * The sibling of TryGetCachedMicrosoftSigned, and it exists for the same reason:
+     * a caller holding a kernel operation open must never reach WinVerifyTrust.  It
+     * returns the whole verdict rather than a Microsoft-signed boolean, because a
+     * caller deciding whether to REFUSE something has to distinguish Revoked and
+     * UntrustedRoot from Unsigned - "not Microsoft-signed" describes most of the
+     * software on a normal machine and is not grounds to refuse anything.
+     *
+     * The verdict is the full-strength one: produced by verifyWithWinTrust with
+     * WTD_REVOKE_WHOLECHAIN against the local CRL cache, so a Revoked answer here
+     * carries real revocation evidence, established on a thread that could afford
+     * to wait for it.
+     *
+     * @return nullopt when no usable cached verdict exists - meaning "not
+     *         determined", NOT "nothing wrong with it".  A caller must read an
+     *         absent verdict as grounds to do nothing, never as an acquittal.
+     */
+    [[nodiscard]] std::optional<SignatureValidationResult>
+    TryGetCachedSignatureResult(std::wstring_view filePath) const;
     
     /**
      * @brief Check if driver is WHQL signed

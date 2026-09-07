@@ -960,6 +960,19 @@ public:
         return cached->isValid && cached->isMicrosoftSigned;
     }
 
+    // Cache-only, exactly as above: getCachedResult performs no verification and
+    // revalidates the entry's last-write time before returning it.  The whole verdict
+    // is returned rather than a boolean because a caller that may REFUSE an operation
+    // has to tell Revoked from Unsigned.
+    [[nodiscard]] std::optional<SignatureValidationResult> TryGetCachedSignatureResult(
+        const std::wstring& filePath) const noexcept {
+        auto cached = getCachedResult(filePath);
+        if (!cached.has_value()) {
+            return std::nullopt;
+        }
+        return cached->result;
+    }
+
     [[nodiscard]] bool IsWHQLSigned(std::wstring_view filePath) noexcept {
         auto result = VerifyFile(std::wstring(filePath));
         return result.isValid && result.isWHQL;
@@ -2922,6 +2935,12 @@ bool DigitalSignatureValidator::IsMicrosoftSigned(std::wstring_view filePath) {
 std::optional<bool> DigitalSignatureValidator::TryGetCachedMicrosoftSigned(
     std::wstring_view filePath) const {
     return m_impl->TryGetCachedMicrosoftSigned(std::wstring(filePath));
+}
+
+std::optional<SignatureValidationResult>
+DigitalSignatureValidator::TryGetCachedSignatureResult(
+    std::wstring_view filePath) const {
+    return m_impl->TryGetCachedSignatureResult(std::wstring(filePath));
 }
 
 bool DigitalSignatureValidator::IsWHQLSigned(std::wstring_view filePath) {
