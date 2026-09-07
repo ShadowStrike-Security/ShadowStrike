@@ -20962,5 +20962,124 @@ class DeadSourceFileContractTests(unittest.TestCase):
         return (ROOT / name).read_bytes().decode("utf-8", errors="replace")
 
 
+class CertificateVerdictAccountingContractTests(unittest.TestCase):
+    """"Not a certificate" and "an untrustworthy certificate" are different facts.
+
+    The certificate validator's raw parser documents that its commonest rejection
+    is a whole PE image handed in by an image-load or process-create caller, and it
+    returns ValidationResult::Error - not Invalid - for precisely that reason.  The
+    statistics did not make the same distinction: the parse-failure path
+    incremented invalidCertificates.
+
+    The consequence was measured in the field the first time these counters became
+    readable.  The report showed 904 validations, 904 "invalid", zero valid, and an
+    average validation time of zero, which reads as a completely broken trust
+    stack.  The truth was that all 904 inputs were PE images that never reached a
+    validation at all.  A counter unable to separate those two turns a caller
+    defect into an apparent cryptographic failure, and it cost a real investigation
+    before the code was read.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.cpp = read_source(CERTIFICATE_VALIDATOR_CPP_PATH)
+        cls.stripped = strip_c_comments(cls.cpp)
+
+    def _validation_funnel(self) -> str:
+        """The single function every certificate validation passes through."""
+        match = re.search(
+            r"ValidationDetails VerifyCertificateWithOptions\s*\(", self.stripped
+        )
+        self.assertIsNotNone(
+            match, msg="VerifyCertificateWithOptions is no longer present"
+        )
+        brace = self.stripped.index("{", match.end())
+        body = self.stripped[brace:_matching_delimiter(self.stripped, brace, "{", "}")]
+        self.assertGreater(
+            len(body),
+            800,
+            msg=f"the validation funnel parsed to only {len(body)} characters",
+        )
+        return body
+
+    def test_a_non_certificate_input_is_not_counted_as_an_invalid_certificate(self) -> None:
+        body = self._validation_funnel()
+
+        # The parse-failure branch: locate it by the call whose failure it handles,
+        # then read only that block.
+        marker = body.find("ParseCertificate(")
+        self.assertGreater(marker, -1, msg="the funnel no longer parses the input")
+        brace = body.find("{", marker)
+        self.assertGreater(brace, -1, msg="no block follows the parse attempt")
+        block = body[brace:_matching_delimiter(body, brace, "{", "}")]
+
+        self.assertIn(
+            "nonCertificateInputs",
+            block,
+            msg=(
+                "the parse-failure branch does not count the input as a "
+                "non-certificate, so an input that was never a certificate is "
+                "indistinguishable in the statistics from one that was judged "
+                "untrustworthy"
+            ),
+        )
+        self.assertNotIn(
+            "invalidCertificates",
+            block,
+            msg=(
+                "the parse-failure branch increments invalidCertificates. An input "
+                "that is not a certificate has not been judged untrustworthy - it "
+                "has not been judged. This is the accounting error that made a "
+                "field report show every certificate as invalid"
+            ),
+        )
+
+    def test_no_error_result_branch_counts_an_invalid_certificate(self) -> None:
+        """The general form: Error and Invalid must not share a counter.
+
+        Written as a property over every branch in the funnel rather than as a
+        check on the one branch that was wrong, because the next author to add an
+        early return has the same choice to make and no reason to know about it.
+        """
+        # Scanned across the WHOLE implementation, not just the validation funnel.
+        # The funnel contains exactly one Error branch, so a funnel-only scan would
+        # key on the same fact as the test above; the file contains twelve, and every
+        # one of them faces the same choice.
+        body = self.stripped
+        offenders: list[str] = []
+        checked = 0
+        for match in re.finditer(r"result = ValidationResult::Error", body):
+            brace = body.rfind("{", 0, match.start())
+            if brace == -1:
+                continue
+            end = _matching_delimiter(body, brace, "{", "}")
+            if end <= match.start():
+                continue
+            checked += 1
+            block = body[brace:end]
+            if "invalidCertificates" in block:
+                offenders.append(block.strip().replace("\r\n", " ")[:110])
+
+        self.assertGreaterEqual(
+            checked,
+            5,
+            msg=(
+                f"only {checked} branches assigning ValidationResult::Error were "
+                "found in the certificate validator; this test proves little if the "
+                "walk stopped finding them"
+            ),
+        )
+        self.assertEqual(
+            [],
+            offenders,
+            msg=(
+                "a branch that returns ValidationResult::Error also counts an "
+                "invalid certificate. Error means the input could not be judged; "
+                "Invalid means it was judged and failed. Sharing one counter makes "
+                f"the field statistic unreadable: {offenders}"
+            ),
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

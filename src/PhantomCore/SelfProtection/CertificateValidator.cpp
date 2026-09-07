@@ -565,6 +565,7 @@ void CertificateValidatorStatistics::Reset() noexcept {
     crlCacheHits = 0;
     validationCacheHits = 0;
     chainBuildFailures = 0;
+    nonCertificateInputs = 0;
     avgValidationTimeUs = 0;
     startTime = Clock::now();
 }
@@ -586,6 +587,7 @@ void CertificateValidatorStatistics::Reset() noexcept {
     oss << "\"crlCacheHits\":" << crlCacheHits << ",";
     oss << "\"validationCacheHits\":" << validationCacheHits << ",";
     oss << "\"chainBuildFailures\":" << chainBuildFailures << ",";
+    oss << "\"nonCertificateInputs\":" << nonCertificateInputs << ",";
     oss << "\"avgValidationTimeUs\":" << avgValidationTimeUs << ",";
     oss << "\"uptimeMs\":" << uptimeMs;
     oss << "}";
@@ -722,6 +724,7 @@ struct InternalAtomicStats {
     std::atomic<uint64_t> crlCacheHits{0};
     std::atomic<uint64_t> validationCacheHits{0};
     std::atomic<uint64_t> chainBuildFailures{0};
+    std::atomic<uint64_t> nonCertificateInputs{0};
     std::atomic<uint64_t> avgValidationTimeUs{0};
     TimePoint startTime = Clock::now();
 
@@ -737,6 +740,7 @@ struct InternalAtomicStats {
         crlCacheHits.store(0, std::memory_order_relaxed);
         validationCacheHits.store(0, std::memory_order_relaxed);
         chainBuildFailures.store(0, std::memory_order_relaxed);
+        nonCertificateInputs.store(0, std::memory_order_relaxed);
         avgValidationTimeUs.store(0, std::memory_order_relaxed);
         startTime = Clock::now();
     }
@@ -754,6 +758,7 @@ struct InternalAtomicStats {
         snap.crlCacheHits        = crlCacheHits.load(std::memory_order_relaxed);
         snap.validationCacheHits = validationCacheHits.load(std::memory_order_relaxed);
         snap.chainBuildFailures  = chainBuildFailures.load(std::memory_order_relaxed);
+        snap.nonCertificateInputs = nonCertificateInputs.load(std::memory_order_relaxed);
         snap.avgValidationTimeUs = avgValidationTimeUs.load(std::memory_order_relaxed);
         snap.startTime           = startTime;
         return snap;
@@ -1236,8 +1241,22 @@ public:
         auto certInfo = ParseCertificate(certData);
         if (!certInfo) {
             details.result = ValidationResult::Error;
-            details.errorMessage = "Failed to parse certificate";
-            m_stats.invalidCertificates.fetch_add(1, std::memory_order_relaxed);
+            details.errorMessage = "Input is not a DER or PEM certificate";
+
+            // NOT invalidCertificates. ParseCertificate already documents that its
+            // commonest rejection is a whole PE image passed in by an image-load or
+            // process-create caller, and it returns Error rather than Invalid for
+            // exactly that reason - so counting it as an invalid CERTIFICATE
+            // contradicted the result this function returns.
+            //
+            // This mattered in the field the first time these statistics became
+            // readable: the report showed 904 validations, 904 "invalid", 0 valid,
+            // and avgValidationTimeUs of 0 - which reads as a totally broken trust
+            // stack. The truth was that all 904 inputs were PE images that never
+            // reached a validation at all. A counter that cannot distinguish
+            // "untrustworthy" from "not a certificate" turns a caller defect into
+            // an apparent crypto failure.
+            m_stats.nonCertificateInputs.fetch_add(1, std::memory_order_relaxed);
             return details;
         }
 

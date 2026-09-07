@@ -887,6 +887,16 @@ struct CertificateValidatorStatistics {
     
     /// @brief Chain building failures
     uint64_t chainBuildFailures{0};
+
+    /// @brief Inputs that were not certificates at all.
+    ///
+    /// Kept SEPARATE from invalidCertificates deliberately.  An input that is not
+    /// a DER/PEM certificate has not been judged untrustworthy - it has not been
+    /// judged.  Counting the two together made a field report read
+    /// "904 of 904 certificates invalid" when the truth was "904 inputs were not
+    /// certificates", which is the difference between a broken trust stack and a
+    /// caller handing a PE image to a raw X.509 parser.
+    uint64_t nonCertificateInputs{0};
     
     /// @brief Average validation time (microseconds) — exponential moving average
     uint64_t avgValidationTimeUs{0};
