@@ -1066,6 +1066,13 @@ public:
         // from "the suppression never ran". Those are indistinguishable in
         // a threat count and are opposite conditions.
         uint64_t heuristicVerdictsSuppressedByTrust;
+
+    /// @brief Heuristic analyses skipped because trust was ALREADY established.
+    ///
+    /// Distinct from heuristicVerdictsSuppressedByTrust, which counts analyses that
+    /// RAN and were then discarded.  This counts the ones that never had to run, so
+    /// the two together say how much of that cost has actually been reclaimed.
+    uint64_t heuristicSkippedOnKnownTrust;
     };
 
     [[nodiscard]] Stats GetStatistics() const;

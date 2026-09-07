@@ -21352,5 +21352,182 @@ class ThreatOutcomeHonestyContractTests(unittest.TestCase):
         )
 
 
+class HeuristicTrustPrecheckContractTests(unittest.TestCase):
+    """Skipping work is only safe while the skip cannot change an outcome.
+
+    Stage 5 used to analyse every file and then, if it scored, ask
+    EvaluatePublisherTrust whether the score could stand - withholding it for a
+    Microsoft-signed file.  In the 1.0.111 field run that pattern spent 118.1
+    seconds across 348 analyses, and the single worst latency event in the entire
+    run - FileSyncClient.dll at 35,797 ms - was followed by "NOT reported:
+    Microsoft-signed" for that same file.  Thirty-six seconds of on-access analysis
+    to produce an answer that was discarded.
+
+    The stage now checks the trust CACHE first and skips the analysis when it
+    already knows the score would be withheld.  Every test here pins one of the
+    conditions that makes that safe, because each has a failure mode that would
+    turn a latency fix into a coverage hole:
+
+      * the check must be cache-only, or the fix trades a tail for a new constant
+        cost on the thread the kernel waits on;
+      * the skip must require a DETERMINED trusted answer, or an unknown file
+        silently stops being analysed;
+      * the skip must not bypass the deeper stages, which are the only thing that
+        can still convict a trusted-but-malicious file;
+      * the detection path must be gated on the skip explicitly, not on a default
+        value that happens to be un-triggering.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.cpp = read_source(SCAN_ENGINE_CPP_PATH)
+        cls.stripped = strip_c_comments(cls.cpp)
+
+    def _stage5(self) -> str:
+        """Stage 5's region, sliced between two diagnostic scope labels.
+
+        Anchored on the labels rather than on `m_config.enableHeuristics`, which
+        occurs in Initialize as well - taking the first match sliced the wrong
+        function entirely and made all four of these tests fail for the wrong
+        reason.  The stage labels are unique by construction, which is exactly what
+        they were introduced for, and uniqueness is asserted rather than assumed.
+        """
+        start_anchor = '"stage05-heuristic"'
+        end_anchor = '"stage05.5-executable"'
+        for anchor in (start_anchor, end_anchor):
+            self.assertEqual(
+                1,
+                self.stripped.count(anchor),
+                msg=f"{anchor} is not unique in ScanEngine; the slice would be a guess",
+            )
+        start = self.stripped.index(start_anchor)
+        end = self.stripped.index(end_anchor, start)
+        body = self.stripped[start:end]
+        self.assertGreater(
+            len(body),
+            600,
+            msg=f"stage 5 sliced to only {len(body)} characters",
+        )
+        return body
+
+    def _skip_branch(self) -> str:
+        body = self._stage5()
+        marker = body.find("if (heuristicSkippedOnTrust)")
+        self.assertGreater(
+            marker,
+            -1,
+            msg=(
+                "stage 5 has no skip branch, so either the pre-check was removed or "
+                "it no longer decides anything"
+            ),
+        )
+        brace = body.index("{", marker)
+        return body[brace:_matching_delimiter(body, brace, "{", "}")]
+
+    def test_the_heuristic_precheck_uses_the_cache_only_trust_accessor(self) -> None:
+        body = self._stage5()
+        self.assertIn(
+            "TryGetCachedMicrosoftSigned",
+            body,
+            msg=(
+                "stage 5's trust pre-check does not use the cache-only accessor, so "
+                "either it was removed or it now performs real verification on the "
+                "path the kernel waits on"
+            ),
+        )
+        blocking = [
+            line.strip()[:90]
+            for line in body.splitlines()
+            if re.search(r"\.VerifyFile\s*\(|(?<!TryGetCached)\bIsMicrosoftSigned\s*\(", line)
+        ]
+        self.assertEqual(
+            [],
+            blocking,
+            msg=(
+                "stage 5's pre-check reaches a BLOCKING verifier. That would move the "
+                "verification cost from the handful of files that score high enough "
+                "to reach EvaluatePublisherTrust onto every file entering stage 5, "
+                f"which trades a latency tail for a constant cost: {blocking}"
+            ),
+        )
+
+    def test_the_heuristic_is_skipped_only_on_a_determined_trusted_verdict(self) -> None:
+        # The DECISION REGION, not the enclosing statement. strip_c_comments turns
+        # the explanatory comment above the pre-check into blank lines, so walking
+        # back to the previous semicolon returns whitespace and nothing else - the
+        # same trap as any window measured in characters across removed comments.
+        # This slice runs from the flag's declaration to the branch that consumes it,
+        # which is exactly the code that decides whether to skip.
+        body = self._stage5()
+        marker = body.find("bool heuristicSkippedOnTrust")
+        self.assertGreater(marker, -1, msg="the skip decision is no longer assigned")
+        consumer = body.find("if (heuristicSkippedOnTrust)", marker)
+        self.assertGreater(
+            consumer, marker, msg="the skip flag is assigned but never consumed"
+        )
+        statement = body[marker:consumer]
+
+        # Counted rather than assertIn: the decision region is about a kilobyte once
+        # the comment above it has been stripped to whitespace, and printing it buries
+        # the message.
+        self.assertGreater(
+            statement.count("has_value()"),
+            0,
+            msg=(
+                "the skip decision does not require a DETERMINED trust verdict. An "
+                "absent answer must never skip analysis - unknown is not trusted, and "
+                "this is the difference between a latency fix and a coverage hole"
+            ),
+        )
+        self.assertNotRegex(
+            statement,
+            r"value_or\s*\(\s*true\s*\)",
+            msg=(
+                "the skip decision treats an absent trust verdict as trusted. That "
+                "silently stops analysing every file whose signature has not been "
+                "determined yet"
+            ),
+        )
+
+    def test_skipping_the_heuristic_does_not_skip_the_deeper_stages(self) -> None:
+        """Stages 6 to 10 are the only thing that can convict a trusted file."""
+        branch = self._skip_branch()
+        for escape in ("goto ", "return "):
+            self.assertNotIn(
+                escape,
+                branch,
+                msg=(
+                    f"the heuristic skip branch contains {escape!r}, so it leaves the "
+                    "scan early. Stages 6 to 10 are exactly what still has to run for "
+                    "a file whose heuristic score was going to be withheld anyway - "
+                    "skipping the score must not skip the engines"
+                ),
+            )
+
+    def test_the_detection_path_is_gated_on_the_skip_explicitly(self) -> None:
+        """Not on a default value that happens not to trigger.
+
+        riskScore defaults to 0.0, and with a sensitivityLevel of 0 the comparison
+        `0.0 >= 0.0` is TRUE - which would carry an empty result into the detection
+        path and report a threat with no name.  The gate must be explicit.
+        """
+        body = self._stage5()
+        marker = body.find("m_config.sensitivityLevel")
+        self.assertGreater(
+            marker, -1, msg="the heuristic detection threshold is no longer present"
+        )
+        window = body[max(0, marker - 400):marker]
+        self.assertIn(
+            "!heuristicSkippedOnTrust",
+            window,
+            msg=(
+                "the heuristic detection condition is not gated on the skip flag, so "
+                "it relies on a default-constructed result being un-triggering. With "
+                "sensitivityLevel 0 that assumption fails and an empty result enters "
+                "the detection path"
+            ),
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

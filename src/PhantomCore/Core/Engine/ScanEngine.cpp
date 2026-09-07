@@ -265,6 +265,7 @@ public:
         // binaries. Zero here while heuristic detections on OS files reappear
         // means the trust path is not running at all.
         std::atomic<uint64_t> heuristicVerdictsSuppressedByTrust{0};
+        std::atomic<uint64_t> heuristicSkippedOnKnownTrust{0};
 
         // Process stats
         std::atomic<uint64_t> processesScanned{0};
@@ -924,6 +925,7 @@ public:
             m_stats.archivesScanned.store(0, std::memory_order_relaxed);
             m_stats.archiveFilesScanned.store(0, std::memory_order_relaxed);
             m_stats.heuristicVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
+        m_stats.heuristicSkippedOnKnownTrust.store(0, std::memory_order_relaxed);
             m_stats.processesScanned.store(0, std::memory_order_relaxed);
             m_stats.peakMemoryBytes.store(0, std::memory_order_relaxed);
             m_stats.startTime = steady_clock::now();
@@ -2713,10 +2715,84 @@ EngineResult ScanEngine::ScanFile(
             SS_DIAG_SCOPE("ScanEngine", "stage05-heuristic");
             const auto stage5Start = steady_clock::now();
 
-            auto heuristicResult = m_impl->m_heuristicAnalyzer->AnalyzeFile(filePath);
+            // DO NOT PAY FOR AN ANSWER ALREADY KNOWN TO BE DISCARDED.
+            //
+            // Below, a score that clears the threshold is checked against
+            // EvaluatePublisherTrust, and a Microsoft-signed file has its score
+            // WITHHELD - only stages 6 to 10 can still convict it. So for a file we
+            // ALREADY know to be Microsoft-signed, this analysis cannot change any
+            // outcome. It can only cost time.
+            //
+            // MEASURED IN THE 1.0.111 FIELD RUN, and the cost is not marginal. Stage
+            // 5 spent 118.1 SECONDS across 348 analyses in a six-minute run - p50
+            // 22ms, p95 759ms, p99 10.1s, max 35.8s. The single worst latency event
+            // in the whole run was
+            //
+            //     FileSyncClient.dll     35,797 ms     risk 40.0
+            //
+            // and that same run logged, for that exact file: "NOT reported:
+            // Microsoft-signed, signer 'Microsoft Corporation'". Thirty-six seconds
+            // of analysis on the on-access path to produce a verdict thrown away on a
+            // signature. Six other files did the same, among them UIAutomationCore.dll
+            // and CertEnroll.dll.
+            //
+            // WHY THE CACHE-ONLY ACCESSOR RATHER THAN EvaluatePublisherTrust ITSELF.
+            // That function calls VerifyFile, the BLOCKING verifier. Hoisting it would
+            // move its cost from the handful of files per run that currently score high
+            // enough to reach it onto ALL 348 that reach stage 5 - trading a tail for a
+            // new constant cost, on the path the kernel waits on.
+            // TryGetCachedMicrosoftSigned is a lookup in an already-populated cache: it
+            // cannot stall, and it cannot reach CryptSvc.
+            //
+            // NO DETECTION IS LOST, AND THAT IS STRUCTURAL RATHER THAN A JUDGEMENT:
+            //   * a cache HIT saying signed is precisely the state in which the code
+            //     below withholds the score, so the outcome is identical and only the
+            //     cost disappears;
+            //   * a cache MISS, or an UNDETERMINED answer, runs the analysis exactly as
+            //     before - nothing is skipped on an unknown;
+            //   * stages 6 to 10 are untouched, so the file still owes every deeper
+            //     engine what it owed before, which is the requirement the suppression
+            //     comment below already states;
+            //   * heuristicResult is used nowhere outside this stage - verified, all
+            //     ten mentions sit between the analysis and the end of the block - so
+            //     not producing it cannot affect anything downstream.
+            bool heuristicSkippedOnTrust = false;
+            if (Security::DigitalSignatureValidator::HasInstance()) {
+                try {
+                    auto& trustValidator = Security::DigitalSignatureValidator::Instance();
+                    if (trustValidator.IsInitialized()) {
+                        const std::optional<bool> knownSigned =
+                            trustValidator.TryGetCachedMicrosoftSigned(filePath);
+                        heuristicSkippedOnTrust =
+                            knownSigned.has_value() && *knownSigned;
+                    }
+                } catch (...) {
+                    // A pre-check we could not complete must not skip the analysis.
+                    heuristicSkippedOnTrust = false;
+                }
+            }
 
-            if (heuristicResult.isMalicious ||
-                heuristicResult.riskScore >= m_impl->m_config.sensitivityLevel * 30.0) {
+            HeuristicResult heuristicResult{};
+            if (heuristicSkippedOnTrust) {
+                m_impl->m_stats.heuristicSkippedOnKnownTrust
+                    .fetch_add(1, std::memory_order_relaxed);
+                SS_LOG_DEBUG(L"ScanEngine",
+                    L"Stage 5 heuristic skipped: already known Microsoft-signed, so a "
+                    L"score would be withheld below. Deeper stages still run: %ls",
+                    filePath.c_str());
+            } else {
+                heuristicResult = m_impl->m_heuristicAnalyzer->AnalyzeFile(filePath);
+            }
+
+            // The skip is tested EXPLICITLY rather than relying on a default-
+            // constructed result falling through. riskScore defaults to 0.0, and with
+            // a sensitivityLevel of 0 the comparison `0.0 >= 0.0` is TRUE - which
+            // would carry an empty result into the detection path and report a threat
+            // with no name. Depending on a default to be un-triggering is exactly the
+            // kind of implicit coupling that breaks when a setting changes.
+            if (!heuristicSkippedOnTrust &&
+                (heuristicResult.isMalicious ||
+                 heuristicResult.riskScore >= m_impl->m_config.sensitivityLevel * 30.0)) {
 
                 // A score is not evidence. Stages 1 to 4 all jump to
                 // finalize_scan on a hit, so arriving here means nothing
@@ -5236,6 +5312,8 @@ ScanEngine::Stats ScanEngine::GetStatistics() const {
         m_impl->m_stats.archiveFilesScanned.load(std::memory_order_relaxed);
     stats.heuristicVerdictsSuppressedByTrust =
         m_impl->m_stats.heuristicVerdictsSuppressedByTrust.load(std::memory_order_relaxed);
+    stats.heuristicSkippedOnKnownTrust =
+        m_impl->m_stats.heuristicSkippedOnKnownTrust.load(std::memory_order_relaxed);
 
     uint64_t totalTimeUs = m_impl->m_stats.totalTimeUs.load(std::memory_order_relaxed);
     if (stats.totalScans > 0) {
@@ -5278,6 +5356,7 @@ void ScanEngine::ResetStatistics() {
     m_impl->m_stats.archivesScanned.store(0, std::memory_order_relaxed);
     m_impl->m_stats.archiveFilesScanned.store(0, std::memory_order_relaxed);
     m_impl->m_stats.heuristicVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.heuristicSkippedOnKnownTrust.store(0, std::memory_order_relaxed);
     m_impl->m_stats.processesScanned.store(0, std::memory_order_relaxed);
     m_impl->m_stats.peakMemoryBytes.store(0, std::memory_order_relaxed);
     m_impl->m_stats.startTime = steady_clock::now();
