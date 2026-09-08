@@ -137,3 +137,57 @@ TEST(CertificateValidatorTests, ConfigurationStatisticsAndHelpersStayAligned) {
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// Field defect from the 1.0.112 run: kernelRevocationBlocks reported
+// 130590394000 - constant across all 134 samples - while its two immediate
+// neighbours in the same struct reported correct, growing values and the
+// counter itself was never incremented once (no revoked certificate existed on
+// that endpoint, which DigitalSignatureValidator's revokedCertificates=0
+// independently confirms).
+//
+// A counter that is never written cannot hold a value, so either the snapshot
+// or the struct is not doing what it appears to. This asserts the invariant
+// directly against the shipped accessor.
+// ---------------------------------------------------------------------------
+TEST(CertificateStatisticsIntegrityTests, FreshCountersAreZeroAndIndependent) {
+    ShadowStrike::Security::CertificateValidatorStatistics stats{};
+
+    EXPECT_EQ(0u, stats.kernelVerdictAlreadyKnown);
+    EXPECT_EQ(0u, stats.kernelVerdictUndetermined);
+    EXPECT_EQ(0u, stats.kernelRevocationBlocks)
+        << "a default-constructed statistics block reports a non-zero refusal "
+           "count; the field has a default member initialiser, so this can only "
+           "mean the struct is not what the reader thinks it is";
+    EXPECT_EQ(0u, stats.avgValidationTimeUs);
+    EXPECT_EQ(0u, stats.totalValidations);
+}
+
+TEST(CertificateStatisticsIntegrityTests, ToJsonReportsWhatTheStructHolds) {
+    ShadowStrike::Security::CertificateValidatorStatistics stats{};
+    stats.kernelVerdictAlreadyKnown = 11;
+    stats.kernelVerdictUndetermined = 22;
+    stats.kernelRevocationBlocks    = 33;
+    stats.avgValidationTimeUs       = 44;
+
+    const std::string json = stats.ToJson();
+
+    EXPECT_NE(std::string::npos, json.find("\"kernelVerdictAlreadyKnown\":11"))
+        << json;
+    EXPECT_NE(std::string::npos, json.find("\"kernelVerdictUndetermined\":22"))
+        << json;
+    EXPECT_NE(std::string::npos, json.find("\"kernelRevocationBlocks\":33"))
+        << json;
+    EXPECT_NE(std::string::npos, json.find("\"avgValidationTimeUs\":44"))
+        << json;
+}
+
+TEST(CertificateStatisticsIntegrityTests, LiveSnapshotStartsAtZero) {
+    // The path the field report actually uses: Instance().GetStatistics().
+    auto& cv = ShadowStrike::Security::CertificateValidator::Instance();
+    const auto stats = cv.GetStatistics();
+
+    EXPECT_EQ(0u, stats.kernelRevocationBlocks)
+        << "GetStatistics() reports a non-zero refusal count on an instance that "
+           "has refused nothing - this is the 1.0.112 field symptom";
+}
