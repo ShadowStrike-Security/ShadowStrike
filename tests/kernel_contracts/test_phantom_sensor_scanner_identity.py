@@ -22468,5 +22468,98 @@ class LogFormatWidthContractTests(unittest.TestCase):
             "wstring directly with %ls.")
 
 
+class MovedFromReadContractTests(unittest.TestCase):
+    """Reading a member of an object that has just been moved from.
+
+    ReportGeneratorImpl::CreateSchedule moved its local into m_schedules and then
+    read sched.scheduleId to log it and to RETURN it. m_schedules is a
+    std::vector<ReportSchedule>, so push_back move-constructs and leaves the
+    source's std::string members empty - the function handed back an empty
+    identifier for a schedule it had genuinely created, and it is [[nodiscard]]
+    precisely because the caller is meant to keep that identifier.
+
+    Assigning to a moved-from object revives it and is legitimate, so this test
+    distinguishes a READ from a WRITE. The subject list is derived from the file,
+    so a container insert added later is covered without editing this test.
+    """
+
+    _INSERT = re.compile(
+        r"(?:push_back|emplace_back|push|emplace|insert)\s*\(\s*std::move\(\s*"
+        r"([A-Za-z_]\w*)\s*\)\s*\)")
+
+    def _moved_from_reads(self, source):
+        """Every insert-by-move whose source object is read afterwards."""
+        lines = source.splitlines()
+        offenders = []
+        sites = 0
+        for match in self._INSERT.finditer(source):
+            var = match.group(1)
+            line_no = source[:match.start()].count("\n") + 1
+            sites += 1
+            for offset in range(line_no, min(len(lines), line_no + 8)):
+                text = lines[offset]
+                stripped = text.strip()
+                if stripped in ("}", "};"):
+                    break
+                # Whole-object assignment revives it entirely.
+                if re.search(r"\b" + re.escape(var) + r"\s*=[^=]", text):
+                    break
+                # A member WRITE revives that member; not a read.
+                if re.search(r"\b" + re.escape(var) + r"\s*\.\s*\w+\s*(?:=[^=]|\+=|-=)", text):
+                    continue
+                # Container/string reuse calls are legitimate on a moved-from object.
+                if re.search(r"\b" + re.escape(var)
+                             + r"\s*\.\s*(?:clear|reset|resize|reserve|assign)\s*\(", text):
+                    continue
+                if re.search(r"\b" + re.escape(var) + r"\s*\.", text) or \
+                   re.search(r"\breturn\s+" + re.escape(var) + r"\b", text):
+                    offenders.append((offset + 1, var, stripped[:110]))
+        return sites, offenders
+
+    def test_report_generator_never_reads_a_moved_from_object(self):
+        source = strip_c_comments(read_source(REPORT_GENERATOR_CPP_PATH))
+        sites, offenders = self._moved_from_reads(source)
+
+        # Anti-vacuity: if the file contains no insert-by-move at all, this test
+        # is not checking anything and must say so rather than passing.
+        self.assertGreaterEqual(
+            sites, 1,
+            "ReportGenerator.cpp contains no container insert by std::move, so "
+            "this contract has nothing to check and its pattern has rotted")
+
+        self.assertEqual(
+            [], offenders,
+            "a moved-from object is read after being inserted into a container: "
+            + repr(offenders)
+            + ". A move leaves non-trivial members (std::string, vector, "
+              "unique_ptr) empty, so capture what you need BEFORE the move.")
+
+    def test_create_schedule_captures_its_identifier_before_the_move(self):
+        """Pin the ORDERING, not merely the presence of a capture.
+
+        A capture that happens after the move would satisfy a presence check
+        while still returning an empty identifier.
+        """
+        source = strip_c_comments(read_source(REPORT_GENERATOR_CPP_PATH))
+        body = extract_c_function(source, "ReportGeneratorImpl::CreateSchedule")
+        self.assertIsNotNone(
+            body, "ReportGeneratorImpl::CreateSchedule was not found, so this "
+                  "contract is no longer anchored to the artifact")
+
+        capture = body.find("const std::string scheduleId = sched.scheduleId;")
+        move = body.find("m_schedules.push_back(std::move(sched))")
+        self.assertNotEqual(
+            -1, capture,
+            "CreateSchedule does not capture the schedule identifier into a "
+            "local before inserting the schedule into m_schedules")
+        self.assertNotEqual(
+            -1, move, "CreateSchedule no longer inserts into m_schedules by "
+                      "move, so this contract is no longer anchored")
+        self.assertLess(
+            capture, move,
+            "CreateSchedule captures the schedule identifier AFTER moving the "
+            "schedule into m_schedules; the captured value would be empty")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

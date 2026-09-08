@@ -1753,11 +1753,20 @@ std::string ReportGeneratorImpl::CreateSchedule(const ReportSchedule& schedule) 
     if (sched.nextRunTime <= std::chrono::system_clock::now())
         sched.nextRunTime = std::chrono::system_clock::now() + std::chrono::hours(1);
 
+    // Capture the identifier BEFORE the move. m_schedules is a
+    // std::vector<ReportSchedule>, so push_back move-constructs from sched and
+    // leaves sched.scheduleId in a valid but unspecified state - in practice
+    // empty. Reading it afterwards handed every caller an empty schedule id for
+    // a schedule that had in fact been created, and CreateSchedule is
+    // [[nodiscard]] precisely because the caller is expected to keep that id.
+    // GenerateReportAsync in this same file already does it this way.
+    const std::string scheduleId = sched.scheduleId;
+
     std::unique_lock lock(m_schedulesMutex);
     m_schedules.push_back(std::move(sched));
 
-    SS_LOG_INFO(L"ReportGen", L"Schedule created: %hs", sched.scheduleId.c_str());
-    return sched.scheduleId;
+    SS_LOG_INFO(L"ReportGen", L"Schedule created: %hs", scheduleId.c_str());
+    return scheduleId;
 }
 
 bool ReportGeneratorImpl::UpdateSchedule(const ReportSchedule& schedule) {
