@@ -1519,6 +1519,12 @@ bool ConfigManager::ImportFromJson(const std::string& json, ConfigLayer targetLa
         return false;
     }
 
+    // Declared outside the try so the handler below can report how much of the
+    // document was already committed. SetRawValue applies each key as the loop
+    // reaches it, so an abort part-way through leaves real state behind.
+    size_t successCount = 0;
+    size_t failureCount = 0;
+
     try {
         Utils::JSON::Json root;
         if (!Utils::JSON::Parse(json, root)) {
@@ -1532,8 +1538,6 @@ bool ConfigManager::ImportFromJson(const std::string& json, ConfigLayer targetLa
         }
 
         const auto& values = root["values"];
-        size_t successCount = 0;
-        size_t failureCount = 0;
         for (auto it = values.begin(); it != values.end(); ++it) {
             std::string key = it.key();
             if (key.empty() || key.size() > ConfigConstants::MAX_KEY_LENGTH) {
@@ -1544,39 +1548,62 @@ bool ConfigManager::ImportFromJson(const std::string& json, ConfigLayer targetLa
             ConfigValue cv;
             const auto& entry = it.value();
 
-            // Prefer the typed-wrapper format {"_t": "<tag>", "_v": <val>}
-            // emitted by the current ExportToJson. Fall back to legacy plain
-            // JSON primitives so that externally-authored config files still load.
-            if (entry.is_object() && entry.contains("_t") && entry.contains("_v")) {
-                const std::string tag = entry["_t"].get<std::string>();
-                const auto& vj = entry["_v"];
-                if (tag == "bool" && vj.is_boolean()) {
-                    cv = ConfigValue{vj.get<bool>()};
-                } else if (tag == "i32" && vj.is_number_integer()) {
-                    cv = ConfigValue{static_cast<int32_t>(vj.get<int64_t>())};
-                } else if (tag == "i64" && vj.is_number_integer()) {
-                    cv = ConfigValue{vj.get<int64_t>()};
-                } else if (tag == "u32" && vj.is_number_integer()) {
-                    cv = ConfigValue{static_cast<uint32_t>(vj.get<int64_t>())};
-                } else if (tag == "u64" && vj.is_number_integer()) {
-                    cv = ConfigValue{static_cast<uint64_t>(vj.get<int64_t>())};
-                } else if (tag == "f64" && vj.is_number_float()) {
-                    cv = ConfigValue{vj.get<double>()};
-                } else if ((tag == "str" || tag == "raw") && vj.is_string()) {
-                    cv = ConfigValue{vj.get<std::string>()};
+            // Decoding one entry must never abandon the document. This function
+            // consumes externally-authored JSON (ImportFromFile reads up to
+            // 10 MB of it), every key is independent, and SetRawValue below
+            // commits each one as it goes - so a throw escaping this loop used
+            // to leave the configuration PARTIALLY APPLIED while the function
+            // returned false, which is strictly worse than rejecting one entry.
+            // A malformed entry is an entry-level fault and is counted as one.
+            try {
+                // Prefer the typed-wrapper format {"_t": "<tag>", "_v": <val>}
+                // emitted by the current ExportToJson. Fall back to legacy plain
+                // JSON primitives so that externally-authored config files still load.
+                //
+                // _t must be checked for is_string() the same way every _v below
+                // is checked for its own type. Without it a non-string tag threw
+                // out of the entire import; with it the entry falls through to the
+                // dump() fallback and is preserved verbatim instead.
+                if (entry.is_object() && entry.contains("_t") && entry.contains("_v")
+                    && entry["_t"].is_string()) {
+                    const std::string tag = entry["_t"].get<std::string>();
+                    const auto& vj = entry["_v"];
+                    if (tag == "bool" && vj.is_boolean()) {
+                        cv = ConfigValue{vj.get<bool>()};
+                    } else if (tag == "i32" && vj.is_number_integer()) {
+                        cv = ConfigValue{static_cast<int32_t>(vj.get<int64_t>())};
+                    } else if (tag == "i64" && vj.is_number_integer()) {
+                        cv = ConfigValue{vj.get<int64_t>()};
+                    } else if (tag == "u32" && vj.is_number_integer()) {
+                        cv = ConfigValue{static_cast<uint32_t>(vj.get<int64_t>())};
+                    } else if (tag == "u64" && vj.is_number_integer()) {
+                        cv = ConfigValue{static_cast<uint64_t>(vj.get<int64_t>())};
+                    } else if (tag == "f64" && vj.is_number_float()) {
+                        cv = ConfigValue{vj.get<double>()};
+                    } else if ((tag == "str" || tag == "raw") && vj.is_string()) {
+                        cv = ConfigValue{vj.get<std::string>()};
+                    } else {
+                        cv = ConfigValue{entry.dump()};
+                    }
+                } else if (entry.is_boolean()) {
+                    cv = ConfigValue{entry.get<bool>()};
+                } else if (entry.is_number_integer()) {
+                    cv = ConfigValue{entry.get<int64_t>()};
+                } else if (entry.is_number_float()) {
+                    cv = ConfigValue{entry.get<double>()};
+                } else if (entry.is_string()) {
+                    cv = ConfigValue{entry.get<std::string>()};
                 } else {
                     cv = ConfigValue{entry.dump()};
                 }
-            } else if (entry.is_boolean()) {
-                cv = ConfigValue{entry.get<bool>()};
-            } else if (entry.is_number_integer()) {
-                cv = ConfigValue{entry.get<int64_t>()};
-            } else if (entry.is_number_float()) {
-                cv = ConfigValue{entry.get<double>()};
-            } else if (entry.is_string()) {
-                cv = ConfigValue{entry.get<std::string>()};
-            } else {
-                cv = ConfigValue{entry.dump()};
+            } catch (const std::exception& ex) {
+                // One unusable entry, named, counted, and skipped. Every
+                // well-formed key before and after it still applies.
+                ++failureCount;
+                SS_LOG_WARN(L"Config",
+                    L"ImportFromJson: skipping malformed entry '%hs': %hs",
+                    key.c_str(), ex.what());
+                continue;
             }
 
             if (SetRawValue(key, cv, targetLayer)) {
@@ -1598,8 +1625,19 @@ bool ConfigManager::ImportFromJson(const std::string& json, ConfigLayer targetLa
         // as a hard import failure so callers can distinguish "applied" from
         // "silently ignored".
         return successCount > 0 || values.size() == 0;
+    } catch (const std::exception& ex) {
+        // Report what was already applied. Returning false while having mutated
+        // the layer is the state a caller most needs to know about, because a
+        // caller that falls back to defaults would otherwise be working against
+        // a half-merged configuration without any record of it.
+        SS_LOG_ERROR(L"Config",
+            L"ImportFromJson: aborted after committing %zu key(s), %zu rejected: %hs",
+            successCount, failureCount, ex.what());
+        return false;
     } catch (...) {
-        SS_LOG_ERROR(L"Config", L"Exception during ImportFromJson");
+        SS_LOG_ERROR(L"Config",
+            L"ImportFromJson: aborted after committing %zu key(s), %zu rejected: "
+            L"unknown exception", successCount, failureCount);
         return false;
     }
 }

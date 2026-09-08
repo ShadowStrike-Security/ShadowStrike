@@ -139,6 +139,7 @@ FILE_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.hpp"
 DATABASE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Database/DatabaseManager.cpp"
 SCAN_ENGINE_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
 REPORT_GENERATOR_CPP_PATH = ROOT / "src" / "PhantomCore" / "Communication" / "ReportGenerator.cpp"
+CONFIG_MANAGER_CPP_PATH = ROOT / "src" / "PhantomCore" / "Config" / "ConfigManager.cpp"
 SCAN_ENGINE_HPP_PATH = SCAN_ENGINE_CPP_PATH.with_suffix(".hpp")
 MEMORY_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/MemoryUtils.hpp"
 MEMORY_PROTECTION_CPP_PATH = (
@@ -22559,6 +22560,133 @@ class MovedFromReadContractTests(unittest.TestCase):
             capture, move,
             "CreateSchedule captures the schedule identifier AFTER moving the "
             "schedule into m_schedules; the captured value would be empty")
+
+
+class ConfigImportIsolationContractTests(unittest.TestCase):
+    """ConfigManager::ImportFromJson consumes externally-authored JSON -
+    ImportFromFile reads up to 10 MB of it - and applies each key with
+    SetRawValue as the loop reaches it.
+
+    entry["_t"].get<std::string>() had no is_string() guard while every _v read
+    beside it was type-checked. A non-string tag therefore threw out of the loop
+    into catch(...), which logged "Exception during ImportFromJson" and returned
+    false - AFTER every preceding key had already been committed. The caller saw
+    a clean failure over a half-merged configuration, with no record of how far
+    the merge had got.
+    """
+
+    def _body(self):
+        source = strip_c_comments(read_source(CONFIG_MANAGER_CPP_PATH))
+        body = extract_c_function(source, "ConfigManager::ImportFromJson")
+        self.assertIsNotNone(
+            body, "ConfigManager::ImportFromJson was not found, so this contract "
+                  "is no longer anchored to the artifact")
+        # Anti-vacuity: the typed-wrapper decode must actually be in this body.
+        for tag in ('"bool"', '"i32"', '"u64"', '"f64"'):
+            self.assertIn(
+                tag, body,
+                "ImportFromJson no longer contains the typed-wrapper decode "
+                "(missing %s), so these assertions are anchored to nothing" % tag)
+        return body
+
+    def test_the_type_tag_is_type_checked_like_every_value_beside_it(self):
+        body = self._body()
+        guard = body.find('entry["_t"].is_string()')
+        read = body.find('entry["_t"].get<std::string>()')
+        self.assertNotEqual(
+            -1, read,
+            "the typed-wrapper tag is no longer read, so this contract is no "
+            "longer anchored")
+        self.assertNotEqual(
+            -1, guard,
+            'ImportFromJson reads entry["_t"] as a string without checking '
+            'is_string() first. A non-string tag throws, and because SetRawValue '
+            'commits each key as the loop reaches it, the throw leaves the '
+            'configuration partially applied.')
+        self.assertLess(
+            guard, read,
+            'the is_string() check on entry["_t"] must precede the '
+            'get<std::string>() that depends on it')
+
+    def test_one_malformed_entry_cannot_abandon_the_whole_document(self):
+        """The decode is wrapped per entry, and the handler CONTINUES.
+
+        A handler that returned instead would satisfy a presence-only check while
+        still discarding every remaining key, so the distinction is asserted.
+        """
+        body = self._body()
+
+        commit = body.find("SetRawValue(key, cv, targetLayer)")
+        self.assertNotEqual(
+            -1, commit,
+            "ImportFromJson no longer commits with SetRawValue, so this contract "
+            "is no longer anchored")
+
+        # The per-entry handler must sit between the decode and the commit.
+        handler = body.find("} catch (const std::exception& ex) {")
+        self.assertNotEqual(
+            -1, handler,
+            "ImportFromJson does not guard the decode of an individual entry, so "
+            "one malformed entry still aborts the whole import")
+        self.assertLess(
+            handler, commit,
+            "the per-entry handler must be closed before SetRawValue commits the "
+            "value, otherwise it is guarding the commit rather than the decode")
+
+        # And it must resume the loop rather than end the function.
+        tail = body[handler:commit]
+        self.assertIn(
+            "continue;", tail,
+            "the per-entry handler does not continue the loop, so a single "
+            "malformed entry still discards every key that follows it")
+        self.assertNotIn(
+            "return false;", tail,
+            "the per-entry handler returns instead of continuing, which "
+            "abandons every remaining key - the defect this contract exists to "
+            "prevent")
+
+    def test_an_aborted_import_reports_what_it_already_committed(self):
+        """Derive the handlers and check EACH one, not the file as a whole.
+
+        A first attempt asserted that the phrase appeared somewhere in the body.
+        ImportFromJson has two function-scope handlers - one for std::exception
+        and one for everything else - so that assertion was satisfied by either
+        of them and a mutation that gutted one passed silently. Every handler
+        that ends the function must report the progress it is abandoning.
+        """
+        body = self._body()
+
+        # Each catch clause, sliced from one to the next.
+        starts = [m.start() for m in re.finditer(r"\}\s*catch\s*\(", body)]
+        self.assertGreaterEqual(
+            len(starts), 2,
+            "ImportFromJson no longer has the handlers this contract describes "
+            "(found %d), so it is no longer anchored to the artifact" % len(starts))
+
+        bounds = starts + [len(body)]
+        ending = []
+        for index in range(len(starts)):
+            clause = body[bounds[index]:bounds[index + 1]]
+            if "return false;" in clause:
+                ending.append(clause)
+
+        self.assertGreaterEqual(
+            len(ending), 1,
+            "no handler in ImportFromJson ends the function, so this contract "
+            "has nothing to check")
+
+        for clause in ending:
+            self.assertIn(
+                "successCount", clause,
+                "a handler that abandons ImportFromJson does not report how many "
+                "keys it had already committed. SetRawValue applies each key as "
+                "the loop reaches it, so a caller that falls back to defaults "
+                "would be working against a half-merged configuration with no "
+                "record of it. Clause: " + clause[:200])
+            self.assertIn(
+                "%zu", clause,
+                "a handler that abandons ImportFromJson names the counters but "
+                "does not format them into the message. Clause: " + clause[:200])
 
 
 if __name__ == "__main__":
