@@ -117,9 +117,35 @@ constexpr wchar_t kPhantomMinifilterName[] = L"PhantomSensor";
             "[IPCManager] FilterLoad('PhantomSensor') succeeded");
         return S_OK;
     }
-    if (hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) {
-        Utils::Logger::Debug(
-            "[IPCManager] Minifilter 'PhantomSensor' already loaded");
+    // ALREADY RESIDENT IS THE DESIGNED OUTCOME, NOT A FAILURE - AND THERE ARE TWO
+    // CODES FOR IT.
+    //
+    // FilterLoad reports an already-loaded filter as ERROR_SERVICE_ALREADY_RUNNING
+    // (1056, HRESULT 0x80070420), because what it actually refuses is starting the
+    // filter's service a second time. Only ERROR_ALREADY_EXISTS (183, 0x800700B7) was
+    // tested here, so the common case fell through to the error branch below.
+    //
+    // MEASURED IN THE 1.0.94 FIELD LOG, and it is the normal path rather than an edge
+    // case: ShadowStrikeDriverResume loads the filter at install time and logged
+    // FilterLoad succeeded with HRESULT 0x00000000; 116 seconds later this function ran
+    // and logged "FilterLoad('PhantomSensor') failed: 0x80070420" at ERROR. The driver
+    // was loaded. The deferral that produces this ordering is deliberate and documented
+    // as preventing a post-FilterLoad ConnectNotify storm on first boot.
+    //
+    // THE COST WAS NOT ONLY COSMETIC. The caller treats FAILED(hr) as grounds to record
+    // m_lastFilterPortHr and raise NotifyError("Minifilter load failed") to the user,
+    // so a healthy machine reported a driver-load failure it had not suffered. Control
+    // flow is unaffected either way - the caller falls through to the port connect
+    // regardless, and the connect result carries the authoritative diagnostic.
+    //
+    // Reported at INFO rather than DEBUG: which agent won the race to load the filter is
+    // worth knowing when reading a field log, and this line is emitted once per connect
+    // attempt rather than per operation.
+    if (hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS) ||
+        hr == HRESULT_FROM_WIN32(ERROR_SERVICE_ALREADY_RUNNING)) {
+        Utils::Logger::Info(
+            "[IPCManager] Minifilter 'PhantomSensor' is already resident "
+            "(loaded by an earlier agent); continuing to port connect");
         return S_OK;
     }
     // ERROR_SERVICE_DOES_NOT_EXIST means the SCM entry is missing — driver
