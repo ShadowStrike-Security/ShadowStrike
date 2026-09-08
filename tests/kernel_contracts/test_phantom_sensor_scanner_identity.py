@@ -21885,5 +21885,232 @@ class KernelTrustHookContractTests(unittest.TestCase):
         )
 
 
+class OnAccessScanBudgetContractTests(unittest.TestCase):
+    """A verdict produced after the kernel has stopped waiting is not protection.
+
+    ScanContext has always carried `std::chrono::milliseconds timeout`, the on-access
+    caller has always set it, and exactly ONE of the fifteen pipeline stages ever read
+    it - stage 4, which passes it to the signature scanner. The other fourteen ignored
+    it, so the value described an intention and constrained nothing.
+
+    MEASURED IN THE 1.0.112 FIELD RUN. The kernel abandons a file scan after 50 ms
+    (read), 150 ms (write) or 500 ms (execute). ScanFile was measured at p95 186 ms,
+    p99 2,205 ms, max 7,340 ms, with single stages at 14,132 ms and 13,056 ms. Six reply
+    timeouts inside two seconds trip the scan bridge's circuit breaker, which then allows
+    files UNSCANNED for thirty seconds. That run: 129 timeouts, and 141,048 circuit-open
+    passes against 4,597 files actually scanned - 96.8 percent of everything reaching the
+    scan decision went uninspected, because the work done for the rest was too slow to be
+    used.
+
+    This is therefore not a detection trade. RealTimeProtection already queues EVERY
+    scanned file to the deferred deep-scan worker unconditionally; the fast path is, in
+    its own words, "a scheduling decision rather than a coverage decision".
+    """
+
+    # Stages 1 (whitelist) and 2 (hash) are deliberately exempt: they are the definitive
+    # precise checks, a hash match is how known malware is caught, and skipping them
+    # would be a coverage loss rather than a scheduling decision.
+    _GATED = ("2.5", "3", "4", "4.5", "4.6", "4.7", "5", "5.5", "6", "7", "8", "9", "10")
+    _EXEMPT = ("1", "2")
+    _GATE = "if (budgetSpent()) { truncatedByBudget = true; goto finalize_scan; }"
+
+    @staticmethod
+    def _scope_label(stage: str) -> str:
+        """Rebuild the SS_DIAG_SCOPE label for a stage number.
+
+        The labels zero-pad the integer part - "stage02.5-threatintel-store", not
+        "stage2.5-" - and strip_c_comments has already removed the "// STAGE n:" banners
+        by the time this test sees the source, so the label is the only anchor left.
+        """
+        head, _, tail = stage.partition(".")
+        return f"stage{int(head):02d}" + (f".{tail}" if tail else "") + "-"
+
+    @classmethod
+    def _scan_file_body(cls) -> str:
+        source = strip_c_comments(read_source(SCAN_ENGINE_CPP_PATH))
+        hits = list(re.finditer(
+            r"^EngineResult ScanEngine::ScanFile\(", source, re.M))
+        if len(hits) != 1:
+            raise AssertionError(
+                f"expected one ScanFile definition, found {len(hits)}")
+        start = hits[0].start()
+        brace = source.index("{", start)
+        depth = 0
+        for i in range(brace, len(source)):
+            if source[i] == "{":
+                depth += 1
+            elif source[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[start:i + 1]
+        raise AssertionError("unbalanced braces in ScanFile")
+
+    def test_every_expensive_stage_is_preceded_by_a_budget_gate(self) -> None:
+        """Subjects derived from the artifact, so a stage added later is covered."""
+        body = self._scan_file_body()
+        missing: list[str] = []
+        for stage in self._GATED:
+            marker = body.find(f'"{self._scope_label(stage)}')
+            if marker == -1:
+                missing.append(f"stage {stage} not found")
+                continue
+            window = body[max(0, marker - 900):marker]
+            if self._GATE not in window:
+                missing.append(f"stage {stage}")
+
+        self.assertEqual(
+            [],
+            missing,
+            msg=(
+                "these pipeline stages can be entered after the time budget has already "
+                "expired, so the engine can still produce a verdict after the kernel has "
+                "given up waiting and allowed the file - which is what tripped the "
+                f"circuit breaker 141,048 times in the field: {missing}"
+            ),
+        )
+
+    def test_the_definitive_fast_stages_are_never_gated(self) -> None:
+        """The exemption is deliberate and must stay deliberate.
+
+        Whitelist and hash are the precise detectors. Gating them to save milliseconds
+        would trade away the detection that actually catches known malware, which is the
+        opposite of what this budget exists to protect.
+        """
+        body = self._scan_file_body()
+        gate_positions = [m.start() for m in
+                          re.finditer(re.escape(self._GATE), body)]
+        for stage in self._EXEMPT:
+            marker = body.find(f'"{self._scope_label(stage)}')
+            self.assertGreater(
+                marker, -1, msg=f"stage {stage} scope label not found")
+            preceding = [g for g in gate_positions if g < marker]
+            self.assertEqual(
+                [],
+                preceding,
+                msg=(
+                    f"stage {stage} is now behind a budget gate. Whitelist and hash are "
+                    "the definitive precise checks - a hash match is how known malware, "
+                    "EICAR included, is caught - and skipping them is a coverage loss, "
+                    "not a scheduling decision"
+                ),
+            )
+
+    def test_a_truncated_scan_is_never_cached(self) -> None:
+        """The safety property the whole change rests on.
+
+        EngineResult default-initialises verdict to Clean and finalize_scan is reached by
+        fall-through and nineteen gotos, so a scan that stopped early carries Clean
+        without having established it. Caching that converts "we ran out of time" into
+        "we checked and it is fine" - the ab8f982d defect exactly.
+        """
+        body = self._scan_file_body()
+        cache = body.find("UpdateCache(fileHash, result)")
+        self.assertGreater(cache, -1, msg="the engine cache write is gone")
+
+        window = body[max(0, cache - 700):cache]
+        # Counted rather than assertIn: the window is 700 characters and printing it
+        # buries the message.
+        self.assertGreater(
+            window.count("truncatedByBudget"),
+            0,
+            msg=(
+                "the engine caches its result without checking whether the scan was "
+                "truncated by its time budget, so one timed-out pass would suppress "
+                "every later inspection of that file for the cache's lifetime"
+            ),
+        )
+        self.assertGreater(
+            body.count("analysisIncomplete"),
+            0,
+            msg="the result no longer reports that analysis was incomplete",
+        )
+
+    def test_a_deep_scan_is_exempt_from_the_budget(self) -> None:
+        """A deferred deep scan runs where nothing waits on it.
+
+        It is the one place the full pipeline is meant to run to completion, so applying
+        the on-access budget there would truncate the very pass that exists to be
+        thorough - and would leave nothing authoritative anywhere.
+        """
+        body = self._scan_file_body()
+        marker = body.find("budgetApplies")
+        self.assertGreater(marker, -1, msg="the budget predicate is gone")
+        decl = body[marker:marker + 260]
+        self.assertGreater(
+            decl.count("!context.deepScan"),
+            0,
+            msg=(
+                "the budget is applied to deep scans as well. The deferred worker is "
+                "where the thorough pass runs and nothing waits on it; truncating it "
+                "would leave no authoritative verdict anywhere"
+            ),
+        )
+
+    def test_the_on_access_budget_fits_inside_the_kernel_timeout(self) -> None:
+        """Cross-artifact, with the subject taken from one side and checked on the other.
+
+        The engine's budget is meaningless unless it is smaller than the window the
+        kernel actually waits. Before this change the engine was handed 29,900 ms for
+        work the kernel abandoned after 500 ms.
+        """
+        rtp = strip_c_comments(read_source(REAL_TIME_PROTECTION_HPP_PATH))
+        m = re.search(
+            r"ON_ACCESS_SCAN_BUDGET_MS\s*=\s*(\d+)", rtp)
+        self.assertIsNotNone(
+            m, msg="the on-access scan budget constant is gone")
+        budget = int(m.group(1))
+
+        kernel = strip_c_comments(read_source(PRE_CREATE_H_PATH))
+        k = re.search(r"PC_SCAN_TIMEOUT_EXECUTE_MS\s+(\d+)", kernel)
+        self.assertIsNotNone(
+            k, msg="the kernel's execute scan timeout is gone")
+        execute = int(k.group(1))
+
+        self.assertLess(
+            budget,
+            execute,
+            msg=(
+                f"the engine is given {budget} ms while the kernel abandons an execute "
+                f"scan after {execute} ms. A verdict produced after that point is "
+                "discarded, so the extra time buys nothing and costs a reply thread"
+            ),
+        )
+
+    def test_the_caller_declines_to_cache_an_incomplete_verdict(self) -> None:
+        """Both caller-side caches, not just one.
+
+        The file-identity cache is the more dangerous of the two because it is consulted
+        BEFORE any scanning happens, so an incomplete verdict stored there skips the
+        pipeline entirely on every subsequent open.
+        """
+        rtp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        # Asserted as the exact guarded EXPRESSION rather than by a window search.
+        # There are three UpdateFileVerdictCache sites and two are correctly unguarded -
+        # they cache on a cached Microsoft-signed trust verdict, where no scan ran and
+        # analysisIncomplete has no meaning - so a positional search cannot distinguish
+        # the one that must be guarded. The conjunction below can only be present if the
+        # post-scan write is guarded, and cannot be satisfied by the other two.
+        for guarded in ("!hashKey.empty() && !engineResult.analysisIncomplete",
+                        "!fileIdentityKey.empty() && !engineResult.analysisIncomplete"):
+            self.assertEqual(
+                1,
+                rtp.count(guarded),
+                msg=(
+                    f"expected exactly one guarded cache write of the form `{guarded}`. "
+                    "Without it a verdict the engine never finished establishing is "
+                    "cached as a determined one, and the file-identity cache is "
+                    "consulted BEFORE any scanning, so that would skip the pipeline "
+                    "entirely on every later open"
+                ),
+            )
+
+        # Anti-vacuity: the writes themselves must still exist. A guard is satisfied by
+        # deleting the thing it guards, and that would be a coverage loss.
+        for call in ("UpdateVerdictCache(hashKey, scanResult)",
+                     "UpdateFileVerdictCache(fileIdentityKey"):
+            self.assertGreater(
+                rtp.count(call), 0, msg=f"{call} has been removed entirely")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

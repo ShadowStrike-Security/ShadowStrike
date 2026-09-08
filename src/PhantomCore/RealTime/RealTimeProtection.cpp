@@ -4242,7 +4242,7 @@ public:
         context.processId = req.ProcessId;
         context.filePath = filePath;
         context.timeout = std::chrono::milliseconds(
-            RTPConstants::KERNEL_REPLY_TIMEOUT_MS - 100);
+            RTPConstants::ON_ACCESS_SCAN_BUDGET_MS);
 
         // 4. Perform Scan
         Core::Engine::EngineResult engineResult;
@@ -4300,8 +4300,14 @@ public:
             } catch (...) {}
         }
 
-        // 7. Update Cache
-        if (!hashKey.empty()) {
+        // 7. Update Cache - BUT NEVER AN INCOMPLETE VERDICT.
+        //
+        // A scan that stopped on its time budget reports Clean by default
+        // initialisation without having established it. Caching that would let one
+        // truncated pass suppress every later inspection of the same file for the
+        // cache's lifetime, which is how a scheduling decision would quietly become a
+        // coverage decision. The deferred deep scan queued above is the authority.
+        if (!hashKey.empty() && !engineResult.analysisIncomplete) {
             UpdateVerdictCache(hashKey, scanResult);
         }
 
@@ -4335,7 +4341,11 @@ public:
             case Core::Engine::ScanVerdict::Clean:
             case Core::Engine::ScanVerdict::Whitelisted:
                 m_stats.cleanFiles++;
-                if (!fileIdentityKey.empty()) {
+                // Same rule as the verdict cache above, and this one matters more: the
+                // file-identity cache is consulted before any scanning happens, so an
+                // incomplete verdict stored here would skip the pipeline entirely on
+                // every subsequent open of that file.
+                if (!fileIdentityKey.empty() && !engineResult.analysisIncomplete) {
                     UpdateFileVerdictCache(fileIdentityKey,
                                            Communication::KernelVerdict::Allow);
                 }

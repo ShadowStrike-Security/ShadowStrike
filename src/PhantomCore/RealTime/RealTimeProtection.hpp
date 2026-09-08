@@ -248,6 +248,23 @@ namespace RTPConstants {
     constexpr uint32_t DEFAULT_SCAN_TIMEOUT_MS = 60000;          // 1 minute
     constexpr uint32_t QUICK_SCAN_TIMEOUT_MS = 5000;             // 5 seconds
     constexpr uint32_t KERNEL_REPLY_TIMEOUT_MS = 30000;          // 30 seconds
+
+    // The budget for a scan performed while the minifilter holds a file operation open.
+    //
+    // NOT KERNEL_REPLY_TIMEOUT_MS. That constant is the IPC wait and is also the
+    // RTPConfig default; using it here handed the engine 29,900 ms for work the kernel
+    // abandons after PC_SCAN_TIMEOUT_READ_MS 50, PC_SCAN_TIMEOUT_WRITE_MS 150 or
+    // PC_SCAN_TIMEOUT_EXECUTE_MS 500. A verdict produced after the kernel has stopped
+    // waiting is discarded, so the only thing the extra time bought was 129 reply
+    // timeouts in a twelve-minute field run, and the circuit-breaker trips those caused.
+    //
+    // 400 ms fits inside the kernel's execute timeout with margin, and matches
+    // kProcessNotifyReplyHorizonMs which already governs the process-notification path
+    // in this product for the same reason.
+    constexpr uint32_t ON_ACCESS_SCAN_BUDGET_MS = 400;
+    static_assert(ON_ACCESS_SCAN_BUDGET_MS < 500,
+                  "must fit inside PC_SCAN_TIMEOUT_EXECUTE_MS or the verdict is "
+                  "produced after the kernel has already allowed the file");
     constexpr uint32_t HEALTH_CHECK_INTERVAL_MS = 60000;         // 1 minute
     constexpr uint32_t STATS_UPDATE_INTERVAL_MS = 5000;          // 5 seconds
     constexpr uint32_t COMPONENT_INIT_TIMEOUT_MS = 30000;        // 30 seconds

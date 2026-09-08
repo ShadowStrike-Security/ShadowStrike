@@ -266,6 +266,7 @@ public:
         // means the trust path is not running at all.
         std::atomic<uint64_t> heuristicVerdictsSuppressedByTrust{0};
         std::atomic<uint64_t> heuristicSkippedOnKnownTrust{0};
+        std::atomic<uint64_t> scansTruncatedByBudget{0};
 
         // Process stats
         std::atomic<uint64_t> processesScanned{0};
@@ -926,6 +927,7 @@ public:
             m_stats.archiveFilesScanned.store(0, std::memory_order_relaxed);
             m_stats.heuristicVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
         m_stats.heuristicSkippedOnKnownTrust.store(0, std::memory_order_relaxed);
+        m_stats.scansTruncatedByBudget.store(0, std::memory_order_relaxed);
             m_stats.processesScanned.store(0, std::memory_order_relaxed);
             m_stats.peakMemoryBytes.store(0, std::memory_order_relaxed);
             m_stats.startTime = steady_clock::now();
@@ -1562,6 +1564,54 @@ EngineResult ScanEngine::ScanFile(
     EngineResult result{};
     const auto scanStart = steady_clock::now();
 
+    // THE DEADLINE THIS FUNCTION IS GIVEN AND HAS NEVER HONOURED.
+    //
+    // ScanContext carries `std::chrono::milliseconds timeout` and the on-access caller
+    // sets it. Exactly ONE of the fifteen stages below ever read it - stage 4 passes it
+    // to the signature scanner as sigScanOpts.timeoutMilliseconds. The other fourteen
+    // ignored it completely, so the value described an intention and constrained
+    // nothing.
+    //
+    // WHAT THAT COST, MEASURED IN THE 1.0.112 FIELD RUN. The kernel abandons a file
+    // scan after PC_SCAN_TIMEOUT_READ_MS 50, PC_SCAN_TIMEOUT_WRITE_MS 150 or
+    // PC_SCAN_TIMEOUT_EXECUTE_MS 500 (PreCreate.h). This function was measured at
+    // p95 186 ms, p99 2,205 ms and a maximum of 7,340 ms, with individual stages
+    // reaching 14,132 ms (stage 5) and 13,056 ms (stage 6).
+    //
+    // Every scan that ran past the kernel's budget produced a verdict NOBODY USED - the
+    // kernel had already timed out and allowed the file - while still occupying one of
+    // only two reply threads. Six such timeouts inside two seconds trip the scan
+    // bridge's circuit breaker (SB_CIRCUIT_TIMEOUT_TRIP_COUNT), which then allows files
+    // UNSCANNED for a thirty-second recovery window. That run recorded 129 timeouts and
+    // 141,048 circuit-open passes against 4,597 files actually scanned: 96.8 percent of
+    // everything that reached the scan decision went uninspected, because the work being
+    // done for the other 3.2 percent was too slow to be used.
+    //
+    // SO THIS IS NOT A DETECTION TRADE. It is the difference between a bounded answer
+    // for every file and an unbounded answer for a few while the rest are waved
+    // through. RealTimeProtection already queues EVERY scanned file to the deferred
+    // deep-scan worker unconditionally, and its own comment states the intent this gate
+    // completes: the fast path is "a scheduling decision rather than a coverage
+    // decision". The thorough pass still runs, moments later, with deepScan set.
+    //
+    // A DEEP SCAN IS EXEMPT. It runs on the deferred worker where nothing waits on it,
+    // and that is the one place the full pipeline is meant to run to completion.
+    //
+    // STAGES 1 AND 2 ARE DELIBERATELY NOT GATED. Whitelist and hash are the definitive
+    // precise checks - a hash match is how known malware is caught, EICAR included - and
+    // skipping them would be a coverage loss rather than a scheduling decision. The gate
+    // starts at stage 2.5.
+    bool truncatedByBudget = false;
+    const bool budgetApplies =
+        !context.deepScan && context.timeout > std::chrono::milliseconds::zero();
+    const auto budgetSpent = [&budgetApplies, &context, &scanStart]() -> bool {
+        if (!budgetApplies) {
+            return false;
+        }
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   steady_clock::now() - scanStart) >= context.timeout;
+    };
+
     // File-type detection is needed by two later stages - one to decide whether
     // this is a document, one to decide whether it is a script - and each was
     // calling FileTypeAnalyzer::Analyze independently. That is two opens and two
@@ -1888,6 +1938,9 @@ EngineResult ScanEngine::ScanFile(
             );
         }
 
+        // BUDGET GATE. See the deadline note at the top of this function.
+        if (budgetSpent()) { truncatedByBudget = true; goto finalize_scan; }
+
         // ====================================================================
         // STAGE 2.5: THREAT INTEL STORE — IOC/REPUTATION LOOKUP
         // ====================================================================
@@ -1959,6 +2012,9 @@ EngineResult ScanEngine::ScanFile(
                 static_cast<long long>(duration_cast<microseconds>(stage25End - stage25Start).count()));
         }
 
+        // BUDGET GATE. See the deadline note at the top of this function.
+        if (budgetSpent()) { truncatedByBudget = true; goto finalize_scan; }
+
         // ====================================================================
         // STAGE 3: THREAT INTELLIGENCE (Cloud/Local Reputation)
         // ====================================================================
@@ -1991,6 +2047,9 @@ EngineResult ScanEngine::ScanFile(
                 std::memory_order_relaxed
             );
         }
+
+        // BUDGET GATE. See the deadline note at the top of this function.
+        if (budgetSpent()) { truncatedByBudget = true; goto finalize_scan; }
 
         // ====================================================================
         // STAGE 4: DEEP SIGNATURE SCAN (YARA + Patterns)
@@ -2120,6 +2179,9 @@ EngineResult ScanEngine::ScanFile(
             );
         }
 
+        // BUDGET GATE. See the deadline note at the top of this function.
+        if (budgetSpent()) { truncatedByBudget = true; goto finalize_scan; }
+
         // ====================================================================
         // STAGE 4.5: DOCUMENT ANALYSIS (OLE/OOXML/PDF/RTF Malware Detection)
         // ====================================================================
@@ -2209,6 +2271,9 @@ EngineResult ScanEngine::ScanFile(
             SS_LOG_TRACE(L"ScanEngine", L"Stage 4.5 DocumentAnalysis: %lldus",
                 static_cast<long long>(duration_cast<microseconds>(stage45End - stage45Start).count()));
         }
+
+        // BUDGET GATE. See the deadline note at the top of this function.
+        if (budgetSpent()) { truncatedByBudget = true; goto finalize_scan; }
 
         // ====================================================================
         // STAGE 4.6: SCRIPT ANALYSIS (PowerShell/Python/JS/VBS/Macro)
@@ -2526,6 +2591,9 @@ EngineResult ScanEngine::ScanFile(
                 static_cast<long long>(duration_cast<microseconds>(stage46End - stage46Start).count()));
         }
 
+        // BUDGET GATE. See the deadline note at the top of this function.
+        if (budgetSpent()) { truncatedByBudget = true; goto finalize_scan; }
+
         // ====================================================================
         // STAGE 4.7: ARCHIVE CONTENT SCANNING
         //
@@ -2707,6 +2775,9 @@ EngineResult ScanEngine::ScanFile(
                     duration_cast<microseconds>(stage47End - stage47Start).count()));
         }
 
+        // BUDGET GATE. See the deadline note at the top of this function.
+        if (budgetSpent()) { truncatedByBudget = true; goto finalize_scan; }
+
         // ====================================================================
         // STAGE 5: HEURISTIC ANALYSIS (PE/Entropy/Import/String Analysis)
         // ====================================================================
@@ -2858,6 +2929,9 @@ EngineResult ScanEngine::ScanFile(
                 std::memory_order_relaxed
             );
         }
+
+        // BUDGET GATE. See the deadline note at the top of this function.
+        if (budgetSpent()) { truncatedByBudget = true; goto finalize_scan; }
 
         // ====================================================================
         // STAGE 5.5: EXECUTABLE ANALYZER (Deep PE/Binary Analysis)
@@ -3019,6 +3093,9 @@ EngineResult ScanEngine::ScanFile(
             }
         }
 
+        // BUDGET GATE. See the deadline note at the top of this function.
+        if (budgetSpent()) { truncatedByBudget = true; goto finalize_scan; }
+
         // ====================================================================
         // STAGE 6: POLYMORPHIC DETECTION + FUZZY SIMILARITY ANALYSIS
         // ====================================================================
@@ -3158,6 +3235,9 @@ EngineResult ScanEngine::ScanFile(
                 static_cast<uint64_t>(duration_cast<microseconds>(stage6End - stage6Start).count()));
         }
 
+        // BUDGET GATE. See the deadline note at the top of this function.
+        if (budgetSpent()) { truncatedByBudget = true; goto finalize_scan; }
+
         // ====================================================================
         // STAGE 7: SANDBOX ANALYSIS (Dynamic Behavior)
         // ====================================================================
@@ -3187,6 +3267,9 @@ EngineResult ScanEngine::ScanFile(
                 goto finalize_scan;
             }
         }
+
+        // BUDGET GATE. See the deadline note at the top of this function.
+        if (budgetSpent()) { truncatedByBudget = true; goto finalize_scan; }
 
         // ====================================================================
         // STAGE 8: EMULATION ENGINE (Code Execution Simulation)
@@ -3358,6 +3441,9 @@ EngineResult ScanEngine::ScanFile(
             }
         }
 
+        // BUDGET GATE. See the deadline note at the top of this function.
+        if (budgetSpent()) { truncatedByBudget = true; goto finalize_scan; }
+
         // ====================================================================
         // STAGE 9: ZERO-DAY DETECTION (Advanced Anomaly Detection)
         // ====================================================================
@@ -3386,6 +3472,9 @@ EngineResult ScanEngine::ScanFile(
                 goto finalize_scan;
             }
         }
+
+        // BUDGET GATE. See the deadline note at the top of this function.
+        if (budgetSpent()) { truncatedByBudget = true; goto finalize_scan; }
 
         // ====================================================================
         // STAGE 10: PHANTOMCORTEX ML ENSEMBLE (AI-Driven Final Classification)
@@ -3577,8 +3666,25 @@ EngineResult ScanEngine::ScanFile(
             std::memory_order_relaxed
         );
 
-        // Update cache
-        m_impl->UpdateCache(fileHash, result);
+        // A TRUNCATED SCAN MUST NOT BE CACHED, AND THAT IS THE WHOLE SAFETY ARGUMENT.
+        //
+        // EngineResult default-initialises verdict to ScanVerdict::Clean, and this label
+        // is reached both by falling through the pipeline and by nineteen gotos. So a
+        // scan that stopped early carries "Clean" without having established it. Caching
+        // that would turn "we ran out of time" into "we checked and it is fine", which
+        // is exactly the defect fixed in ab8f982d where a file we merely failed to read
+        // became a cached assertion about itself.
+        //
+        // The result is marked incomplete instead, so the caller can decline to cache it
+        // too, and the deferred deep scan - already queued unconditionally by
+        // RealTimeProtection for every scanned file - remains the authority.
+        if (truncatedByBudget) {
+            result.analysisIncomplete = true;
+            m_impl->m_stats.scansTruncatedByBudget.fetch_add(
+                1, std::memory_order_relaxed);
+        } else {
+            m_impl->UpdateCache(fileHash, result);
+        }
 
         // Record scan result to persistent LogDB
         try {
@@ -5314,6 +5420,8 @@ ScanEngine::Stats ScanEngine::GetStatistics() const {
         m_impl->m_stats.heuristicVerdictsSuppressedByTrust.load(std::memory_order_relaxed);
     stats.heuristicSkippedOnKnownTrust =
         m_impl->m_stats.heuristicSkippedOnKnownTrust.load(std::memory_order_relaxed);
+    stats.scansTruncatedByBudget =
+        m_impl->m_stats.scansTruncatedByBudget.load(std::memory_order_relaxed);
 
     uint64_t totalTimeUs = m_impl->m_stats.totalTimeUs.load(std::memory_order_relaxed);
     if (stats.totalScans > 0) {
@@ -5357,6 +5465,7 @@ void ScanEngine::ResetStatistics() {
     m_impl->m_stats.archiveFilesScanned.store(0, std::memory_order_relaxed);
     m_impl->m_stats.heuristicVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
     m_impl->m_stats.heuristicSkippedOnKnownTrust.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.scansTruncatedByBudget.store(0, std::memory_order_relaxed);
     m_impl->m_stats.processesScanned.store(0, std::memory_order_relaxed);
     m_impl->m_stats.peakMemoryBytes.store(0, std::memory_order_relaxed);
     m_impl->m_stats.startTime = steady_clock::now();

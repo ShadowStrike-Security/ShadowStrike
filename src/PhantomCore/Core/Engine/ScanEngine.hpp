@@ -337,6 +337,14 @@ struct EngineResult {
     // Additional context
     std::wstring errorMessage;
     uint32_t errorCode = 0;
+
+    /// @brief True when the pipeline stopped early because its time budget expired.
+    ///
+    /// The verdict in this result is therefore a floor, not a conclusion: what ran found
+    /// nothing, and what did not run has not spoken. A caller must NOT cache a verdict
+    /// carrying this flag, because doing so converts "not determined" into "determined
+    /// clean". The deferred deep scan is the authority for these files.
+    bool analysisIncomplete = false;
 };
 
 /**
@@ -1073,6 +1081,14 @@ public:
     /// RAN and were then discarded.  This counts the ones that never had to run, so
     /// the two together say how much of that cost has actually been reclaimed.
     uint64_t heuristicSkippedOnKnownTrust;
+
+    /// @brief On-access scans that stopped early because the time budget expired.
+    ///
+    /// Non-zero is normal and healthy - it means the engine is answering inside the
+    /// window the kernel actually waits, instead of producing verdicts after the kernel
+    /// has given up. What matters is the RATIO to totalScans, and that the kernel's own
+    /// timeouts and circuitOpen counters fall as this one rises.
+    uint64_t scansTruncatedByBudget;
     };
 
     [[nodiscard]] Stats GetStatistics() const;
