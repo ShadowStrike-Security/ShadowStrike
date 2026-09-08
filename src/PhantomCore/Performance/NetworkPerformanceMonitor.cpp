@@ -667,12 +667,38 @@ private:
             // Rate computation against previous snapshot
             const uint32_t idx = row.InterfaceIndex;
             InterfacePrevData prev{};
+            bool hasBaseline = false;
             {
                 std::shared_lock dLock(m_dataMutex);
                 auto it = m_prevInterfaceData.find(idx);
-                if (it != m_prevInterfaceData.end())
+                if (it != m_prevInterfaceData.end()) {
                     prev = it->second;
+                    hasBaseline = true;
+                }
             }
+
+            // A rate needs two samples of a cumulative counter. Without a
+            // previous sample, prev is all zeroes and every delta below becomes
+            // the interface's ENTIRE lifetime total, which divided by one
+            // polling interval reports all traffic since boot as though it had
+            // happened in that interval. That is the "High bandwidth: 7497.4
+            // Mbps (threshold=100.0 Mbps)" alert in the 1.0.94 field log, on a
+            // machine whose real throughput never came close: 7497.4 Mbps for
+            // one second is about 937 MB, which is a plausible amount for that
+            // interface to have carried since boot.
+            //
+            // The interval itself was never at fault - deltaT is clamped to 1.0
+            // below 1 ms, so it cannot be near zero. Only the numerator was.
+            //
+            // A counter that has gone BACKWARDS is the same situation: the
+            // interface was reset or replaced, so the old sample is not a
+            // baseline for the new one and no rate can be derived from the pair.
+            const bool countersWentBackwards =
+                (st.totalBytesIn    < prev.bytesIn)   ||
+                (st.totalBytesOut   < prev.bytesOut)  ||
+                (st.totalPacketsIn  < prev.packetsIn) ||
+                (st.totalPacketsOut < prev.packetsOut);
+            const bool rateIsMeaningful = hasBaseline && !countersWentBackwards;
 
             auto safeDelta = [](uint64_t cur, uint64_t old) -> uint64_t {
                 return (cur >= old) ? (cur - old) : cur;  // counter reset → use cur
@@ -687,14 +713,19 @@ private:
             const uint64_t dDiscIn    = safeDelta(st.discardsIn,      prev.discardsIn);
             const uint64_t dDiscOut   = safeDelta(st.discardsOut,     prev.discardsOut);
 
-            st.inboundBitsPerSec     = (dBytesIn  * 8.0) / deltaT;
-            st.outboundBitsPerSec    = (dBytesOut  * 8.0) / deltaT;
-            st.inboundPacketsPerSec  = static_cast<double>(dPktsIn)  / deltaT;
-            st.outboundPacketsPerSec = static_cast<double>(dPktsOut) / deltaT;
-            st.errorRateIn           = static_cast<double>(dErrIn)   / deltaT;
-            st.errorRateOut          = static_cast<double>(dErrOut)  / deltaT;
-            st.discardRateIn         = static_cast<double>(dDiscIn)  / deltaT;
-            st.discardRateOut        = static_cast<double>(dDiscOut) / deltaT;
+            // Every rate is gated on having a usable pair of samples. Reporting
+            // zero for the first observation of an interface is honest - no rate
+            // has been measured yet - and it also keeps an unbaselined sample out
+            // of CheckHighBandwidth, which sums these fields, so a first poll can
+            // no longer raise an alert on a number that was never a rate.
+            st.inboundBitsPerSec     = rateIsMeaningful ? (dBytesIn  * 8.0) / deltaT : 0.0;
+            st.outboundBitsPerSec    = rateIsMeaningful ? (dBytesOut * 8.0) / deltaT : 0.0;
+            st.inboundPacketsPerSec  = rateIsMeaningful ? static_cast<double>(dPktsIn)  / deltaT : 0.0;
+            st.outboundPacketsPerSec = rateIsMeaningful ? static_cast<double>(dPktsOut) / deltaT : 0.0;
+            st.errorRateIn           = rateIsMeaningful ? static_cast<double>(dErrIn)   / deltaT : 0.0;
+            st.errorRateOut          = rateIsMeaningful ? static_cast<double>(dErrOut)  / deltaT : 0.0;
+            st.discardRateIn         = rateIsMeaningful ? static_cast<double>(dDiscIn)  / deltaT : 0.0;
+            st.discardRateOut        = rateIsMeaningful ? static_cast<double>(dDiscOut) / deltaT : 0.0;
 
             // Accumulate globals
             gStats.totalInboundBitsPerSec  += st.inboundBitsPerSec;

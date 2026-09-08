@@ -83,6 +83,8 @@ MAIN_PAGE_QML_PATH = (
 SELF_DEFENSE_HPP_PATH = ROOT / "src/PhantomCore/SelfProtection/SelfDefense.hpp"
 ANTIVIRUS_SERVICE_HPP_PATH = ROOT / "src/PhantomCore/Service/AntivirusService.hpp"
 ANTIVIRUS_SERVICE_CPP_PATH = ROOT / "src/PhantomCore/Service/AntivirusService.cpp"
+NETWORK_PERFORMANCE_MONITOR_CPP_PATH = (
+    ROOT / "src" / "PhantomCore" / "Performance" / "NetworkPerformanceMonitor.cpp")
 # The single place the shipped product version is written down. Both the service
 # log (task 104) and Invoke-PhantomDeploy.ps1 read it, so the macro name is a
 # contract between a C++ source and a PowerShell harness that no compiler checks.
@@ -22819,6 +22821,130 @@ class ModuleStatusHonestyContractTests(unittest.TestCase):
                 "the %s field must consult %s, otherwise it reports a "
                 "constructed-but-uninitialised singleton as an active module"
                 % (field, call))
+
+
+class UnbaselinedRateContractTests(unittest.TestCase):
+    """A rate derived from a cumulative counter needs TWO samples.
+
+    CollectInterfaceStats default-constructs prev and only overwrites it when the
+    interface already has an entry, so the first poll of an interface measured
+    every delta against zero - the whole lifetime counter - and divided it by one
+    polling interval. The 1.0.94 field log reported
+
+        ALERT [type=0 sev=3 pid=0]: High bandwidth: 7497.4 Mbps (threshold=100.0 Mbps)
+
+    on a VM that never carried anything close to 7.5 Gbps. 7497.4 Mbps sustained
+    for one second is about 937 MB, a plausible amount for that interface to have
+    carried since boot.
+
+    The polling interval was never at fault: deltaT is clamped to 1.0 whenever it
+    is under a millisecond, so it cannot be near zero. Only the numerator was.
+    """
+
+    _RATE_FIELD = re.compile(
+        r"^\s*st\.(\w*(?:BitsPerSec|PacketsPerSec|Rate(?:In|Out)))\s*=([^;]*);",
+        re.M)
+
+    def _source(self):
+        source = strip_c_comments(read_source(NETWORK_PERFORMANCE_MONITOR_CPP_PATH))
+        self.assertIn(
+            "CollectInterfaceStats", source,
+            "CollectInterfaceStats was not found, so this contract is no longer "
+            "anchored to the artifact")
+        return source
+
+    def test_every_interface_rate_is_gated_on_having_two_samples(self):
+        """Derived: every rate assignment is checked, so a rate added later is
+        covered without editing this test."""
+        source = self._source()
+        assignments = self._RATE_FIELD.findall(source)
+
+        # Anti-vacuity: the rates must still be computed here.
+        self.assertGreaterEqual(
+            len(assignments), 8,
+            "expected at least eight per-interface rate assignments in "
+            "NetworkPerformanceMonitor.cpp; found %d, so this contract is no "
+            "longer anchored" % len(assignments))
+
+        ungated = []
+        for field, expression in assignments:
+            if "deltaT" not in expression:
+                continue
+            if "rateIsMeaningful" not in expression:
+                ungated.append(field)
+
+        self.assertEqual(
+            [], ungated,
+            "these per-interface rates divide by the polling interval without "
+            "first establishing that a previous sample exists: " + repr(ungated)
+            + ". On the first poll of an interface the delta is its entire "
+              "lifetime counter, which reports all traffic since boot as one "
+              "interval's throughput.")
+
+    def test_the_baseline_flag_is_only_set_when_a_previous_sample_was_found(self):
+        """The gate is only meaningful if the flag tracks reality.
+
+        Setting hasBaseline unconditionally would satisfy the derived test above
+        while restoring the defect exactly, so the flag is pinned to the branch
+        that proves a previous sample exists.
+
+        A first version of this test looked for the assignment within a 400
+        character window after the lookup. That window also contains the code
+        immediately AFTER the if-block, so hoisting the assignment out of the
+        branch - the precise mutation this test exists to catch - passed. The
+        block is now brace-matched, which cannot be fooled by proximity.
+        """
+        source = self._source()
+
+        condition = "if (it != m_prevInterfaceData.end()) {"
+        start = source.find(condition)
+        self.assertNotEqual(
+            -1, start,
+            "the previous-sample lookup branch was not found, so this contract "
+            "is no longer anchored to the artifact")
+
+        open_brace = source.index("{", start + len(condition) - 1)
+        depth = 0
+        end = -1
+        for index in range(open_brace, len(source)):
+            if source[index] == "{":
+                depth += 1
+            elif source[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = index
+                    break
+        self.assertNotEqual(-1, end, "the lookup branch is not brace-balanced")
+        branch = source[open_brace:end]
+
+        self.assertIn(
+            "hasBaseline = true;", branch,
+            "hasBaseline is not raised INSIDE the branch that found a previous "
+            "sample. Set anywhere else it claims a baseline that does not exist, "
+            "which is the original defect. Branch: " + " ".join(branch.split())[:150])
+        self.assertIn(
+            "prev = it->second;", branch,
+            "the branch no longer copies the previous sample, so this contract "
+            "is no longer anchored")
+
+    def test_a_counter_that_went_backwards_does_not_produce_a_rate(self):
+        """An interface reset or replacement makes the old sample useless as a
+        baseline, which is the same situation as having no sample at all."""
+        source = self._source()
+        self.assertIn(
+            "countersWentBackwards", source,
+            "a counter that has decreased is not detected, so a reset interface "
+            "would produce a rate from an unusable pair of samples")
+        gate = source.find("rateIsMeaningful =")
+        self.assertNotEqual(-1, gate, "the rate gate was not found")
+        expression = source[gate:source.index(";", gate)]
+        self.assertIn(
+            "hasBaseline", expression,
+            "the rate gate does not require a baseline: " + expression[:120])
+        self.assertIn(
+            "countersWentBackwards", expression,
+            "the rate gate does not exclude a counter that went backwards: "
+            + expression[:120])
 
 
 if __name__ == "__main__":
