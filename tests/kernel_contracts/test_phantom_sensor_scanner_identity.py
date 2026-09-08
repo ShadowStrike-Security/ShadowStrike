@@ -22689,5 +22689,137 @@ class ConfigImportIsolationContractTests(unittest.TestCase):
                 "does not format them into the message. Clause: " + clause[:200])
 
 
+class ModuleStatusHonestyContractTests(unittest.TestCase):
+    """HasInstance() is a one-way process-global latch: it is set by the first
+    Instance() call and never cleared (IPCManager.cpp:229-239,
+    CryptoManager.cpp:766-779). It answers "was this singleton ever touched",
+    not "is this module working".
+
+    GetStatusReport derived cryptoManager, tamperProtection and ipcManager from
+    that latch alone, so a merely-constructed - or already shut down - singleton
+    reported as an active module. The selfDefense and serviceCommunication fields
+    in the same function already paired the latch with a liveness predicate, and
+    IsHealthy() below does so for these same three modules, so the file
+    contradicted itself.
+
+    Same family as task 82: a health field that reports success in a state where
+    the module does nothing.
+    """
+
+    _LIVENESS = ("IsInitialized()", "IsRunning()", "IsActive()", "IsHealthy()")
+
+    def _status_report_body(self):
+        """Brace-match the function rather than looking for a trailing comment.
+
+        A first version ended the slice at the "// root" comment. read_source is
+        passed through strip_c_comments first, which turns comments into blank
+        lines, so that marker never existed and both tests failed on an unmodified
+        tree. Brace matching does not depend on anything the stripper removes.
+        """
+        source = strip_c_comments(read_source(ANTIVIRUS_SERVICE_CPP_PATH))
+        marker = "std::string GetStatusReport() const {"
+        start = source.find(marker)
+        self.assertNotEqual(
+            -1, start,
+            "GetStatusReport was not found in AntivirusService.cpp, so this "
+            "contract is no longer anchored to the artifact")
+        open_brace = source.index("{", start + len(marker) - 1)
+        depth = 0
+        end = -1
+        for index in range(open_brace, len(source)):
+            if source[index] == "{":
+                depth += 1
+            elif source[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = index
+                    break
+        self.assertNotEqual(
+            -1, end, "GetStatusReport's body is not brace-balanced")
+        body = source[start:end]
+        # Anti-vacuity on the slice itself: a body that lost the module block
+        # would make every assertion below trivially true.
+        self.assertTrue(
+            "modules" in body,
+            "the extracted GetStatusReport body no longer contains the module "
+            "block, so these assertions are anchored to nothing")
+        return body
+
+    def test_no_module_field_is_decided_by_the_instance_latch_alone(self):
+        """Derived from the artifact: every latch-guarded block is checked, so a
+        module added later is covered without editing this test.
+
+        The liveness check may sit EITHER in the condition (as cryptoManager,
+        tamperProtection, ipcManager and selfDefense do) OR inside the branch (as
+        serviceCommunication does, emitting IsRunning() directly into the value).
+        Both are honest. A first version of this test inspected only conditions
+        and therefore failed on serviceCommunication, which is correct code - the
+        model was wrong, not the source. What matters is that the DECISION for a
+        field consults liveness somewhere, so each latch-guarded block is taken
+        whole.
+        """
+        body = self._status_report_body()
+
+        blocks = []
+        for match in re.finditer(r"if\s*\([^{;]*?HasInstance\(\)[^{;]*?\)\s*\{", body, re.S):
+            depth = 0
+            end = match.end()
+            for index in range(match.end() - 1, len(body)):
+                if body[index] == "{":
+                    depth += 1
+                elif body[index] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = index
+                        break
+            blocks.append((match.group(0), body[match.start():end]))
+
+        # Anti-vacuity: the function must still decide module fields this way.
+        self.assertGreaterEqual(
+            len(blocks), 3,
+            "GetStatusReport has fewer than three HasInstance()-guarded blocks "
+            "(found %d), so this contract is no longer anchored to the shape it "
+            "describes" % len(blocks))
+
+        offenders = []
+        for condition, block in blocks:
+            if not any(predicate in block for predicate in self._LIVENESS):
+                # Report the condition only. Embedding the whole block produced a
+                # 2898-character failure line, which is unreadable.
+                offenders.append(" ".join(condition.split())[:110])
+
+        self.assertEqual(
+            [], offenders,
+            "GetStatusReport decides a module field from HasInstance() alone: "
+            + repr(offenders)
+            + ". That latch is set by the first Instance() call and never "
+              "cleared, so it reports a constructed-but-dead module as active. "
+              "Consult IsInitialized(), IsRunning() or IsActive() as well.")
+
+    def test_the_three_modules_a_field_run_misreported_are_named_explicitly(self):
+        """The derived test above would also pass if these three fields were
+        simply deleted, so pin each one by name and require it to consult its own
+        module's liveness."""
+        body = self._status_report_body()
+
+        required = {
+            "cryptoManager": "Security::CryptoManager::Instance().IsInitialized()",
+            "tamperProtection": "Security::TamperProtection::Instance().IsInitialized()",
+            "ipcManager": "Communication::IPCManager::Instance().IsInitialized()",
+        }
+        for field, call in required.items():
+            # assertTrue rather than assertIn: assertIn embeds the haystack in its
+            # standard message, and the haystack here is the whole function, which
+            # produced a 2898-character failure line.
+            self.assertTrue(
+                ('\\"' + field + '\\":true') in body,
+                "the %s field is no longer reported by GetStatusReport" % field)
+            self.assertTrue(
+                call in body,
+                "the %s field must consult %s, otherwise it reports a "
+                "constructed-but-uninitialised singleton as an active module"
+                % (field, call))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

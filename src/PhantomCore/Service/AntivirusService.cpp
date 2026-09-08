@@ -1160,15 +1160,20 @@ public:
         // Threat Intel
         ss << "\"threatIntel\":" << (ThreatIntel::ThreatIntelManager::Instance().IsInitialized() ? "true" : "false") << ",";
 
-        // CryptoManager
-        if (Security::CryptoManager::HasInstance()) {
+        // CryptoManager. HasInstance() alone is a latch that says the
+        // singleton was constructed at some point, not that it is usable, so it
+        // is paired with IsInitialized() the way selfDefense below already does
+        // and the way IsHealthy() does for this same module.
+        if (Security::CryptoManager::HasInstance() &&
+            Security::CryptoManager::Instance().IsInitialized()) {
             ss << "\"cryptoManager\":true,";
         } else {
             ss << "\"cryptoManager\":false,";
         }
 
         // TamperProtection
-        if (Security::TamperProtection::HasInstance()) {
+        if (Security::TamperProtection::HasInstance() &&
+            Security::TamperProtection::Instance().IsInitialized()) {
             ss << "\"tamperProtection\":true,";
         } else {
             ss << "\"tamperProtection\":false,";
@@ -1188,7 +1193,8 @@ public:
         }
 
         // IPCManager
-        if (Communication::IPCManager::HasInstance()) {
+        if (Communication::IPCManager::HasInstance() &&
+            Communication::IPCManager::Instance().IsInitialized()) {
             ss << "\"ipcManager\":true,";
         } else {
             ss << "\"ipcManager\":false,";
