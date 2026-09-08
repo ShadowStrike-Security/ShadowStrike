@@ -712,4 +712,32 @@
   <Target Name="VerifyTestFixtureUniqueness" BeforeTargets="ClCompile">
     <CheckTestFixtureUniqueness Sources="@(ClCompile)" />
   </Target>
+  <!--
+    Put the VENDORED ONNX runtime beside the test executable, in every configuration.
+
+    WHY THIS EXISTS. bin\Debug had no onnxruntime.dll while bin\Release did, so a Debug
+    test run resolved the bare module name off the system search path and loaded a FOREIGN
+    runtime - measured as "The requested API version [20] is not available, only API
+    versions [1, 17] are supported ... Current ORT Version is: 1.17.1". Any ML assertion in
+    a Debug run therefore depended on whatever ORT happened to be installed on the host,
+    which makes those results unreproducible across machines and quietly different from
+    what ships.
+
+    AND IT COVERS RELEASE DELIBERATELY, not just the configuration that was broken. There
+    was no copy step in this project at all, so the Release copy was a manual artefact that
+    a clean checkout would not reproduce - the same defect waiting to happen on the next
+    machine. SkipUnchangedFiles keeps it free on incremental builds.
+
+    Condition guards the source so a checkout without the vendored runtime fails the ML
+    tests honestly at load time rather than failing the build for everyone.
+  -->
+  <Target Name="DeployOnnxRuntime" AfterTargets="Link"
+          Condition="Exists('$(SolutionDir)vendor\onnxruntime\lib\onnxruntime.dll')">
+    <ItemGroup>
+      <OnnxRuntimeBinaries Include="$(SolutionDir)vendor\onnxruntime\lib\*.dll" />
+    </ItemGroup>
+    <Copy SourceFiles="@(OnnxRuntimeBinaries)"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true" />
+  </Target>
 </Project>

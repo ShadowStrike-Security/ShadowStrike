@@ -22224,5 +22224,143 @@ class ScanEngineStatisticsReadabilityContractTests(unittest.TestCase):
         )
 
 
+class DeployToolingIntegrityContractTests(unittest.TestCase):
+    """The deploy harness and the test build must not depend on the host's mood.
+
+    TASK 98. Invoke-PhantomDeploy.ps1 had no UTF-8 BOM and 3,021 bytes above 0x7F - one
+    em dash, one arrow, 909 box-drawing rules and 96 double rules. PowerShell 5.1 reads a
+    BOM-less script as the ANSI code page, cp1254 on this host, so every one of those
+    became mojibake. That is not cosmetic: the 1.0.111 deploy run under `powershell`
+    mangled its own output, died at its signature-pin check, and left a STALE 1.0.110
+    installer in place that was only caught by comparing file timestamps. A BOM would fix
+    PowerShell alone; removing the characters fixes every reader, including the
+    Select-String and Python log parsing this repository does.
+
+    TASK 87. bin/Debug had no onnxruntime.dll while bin/Release did, so a Debug test run
+    resolved the bare module name off the system search path and loaded a FOREIGN runtime
+    - measured as "The requested API version [20] is not available, only API versions
+    [1, 17] are supported ... Current ORT Version is: 1.17.1". The vendored runtime is
+    1.20.20241119 and ORT_API_VERSION is 20, so Release was internally consistent - but
+    NOTHING IN THE BUILD PUT IT THERE. The project had no copy step at all, so the Release
+    copy was a manual artefact a clean checkout would not reproduce.
+    """
+
+    def test_the_deploy_harness_is_pure_ascii(self) -> None:
+        raw = (ROOT / "tools" / "vm-harness"
+               / "Invoke-PhantomDeploy.ps1").read_bytes()
+        offenders = [b for b in raw if b > 0x7F]
+        self.assertEqual(
+            0,
+            len(offenders),
+            msg=(
+                f"the deploy harness holds {len(offenders)} bytes above 0x7F and has no "
+                "UTF-8 BOM, so PowerShell 5.1 reads it as the ANSI code page and mangles "
+                "its own log. That is how a stale installer shipped once already"
+            ),
+        )
+
+    def test_the_test_build_deploys_the_vendored_onnx_runtime(self) -> None:
+        """Every configuration, not only the one that was broken.
+
+        Fixing Debug alone would leave the Release copy a manual artefact, which is the
+        same defect waiting for the next clean checkout.
+        """
+        proj = read_source(ROOT / "PhantomTests.vcxproj")
+        marker = proj.find('<Target Name="DeployOnnxRuntime"')
+        self.assertGreater(
+            marker, -1,
+            msg=("PhantomTests has no target deploying the vendored ONNX runtime, so the "
+                 "runtime beside phantom-tests.exe is whatever the host happens to have"),
+        )
+        target = proj[marker:proj.index("</Target>", marker)]
+
+        self.assertIn(
+            "vendor",
+            target,
+            msg="the deploy target does not source the runtime from vendor/",
+        )
+        self.assertIn(
+            "$(OutDir)",
+            target,
+            msg="the deploy target does not copy into the build output directory",
+        )
+        # No Configuration condition on the target: a Debug-only or Release-only copy is
+        # the defect itself. The OPENING TAG is inspected rather than the whole target,
+        # because the body legitimately mentions configurations in prose and MSBuild
+        # writes the condition as "'$(Configuration)'=='Debug'" - quoted - so searching
+        # the body for an unquoted form is an assertion that can never fire. It did not:
+        # a mutation adding exactly that condition was not caught until this was fixed.
+        opening = proj[marker:proj.index(">", marker)]
+        self.assertNotIn(
+            "Configuration",
+            opening,
+            msg=(
+                "the deploy target is conditioned on the build configuration. Release "
+                "already had the DLL by hand and Debug did not; a per-configuration copy "
+                f"leaves the other one depending on the host. Opening tag: {opening}"
+            ),
+        )
+
+
+class MinifilterLoadReportingContractTests(unittest.TestCase):
+    """A healthy outcome must not be reported as a failure, least of all to the user.
+
+    FilterLoad reports an already-resident filter as ERROR_SERVICE_ALREADY_RUNNING
+    (1056, HRESULT 0x80070420), because what it refuses is starting the filter's service
+    twice. The already-loaded branch tested only ERROR_ALREADY_EXISTS (183, 0x800700B7),
+    so the ordinary case fell through to the error branch.
+
+    MEASURED IN THE 1.0.94 FIELD LOG, and it is the normal path: ShadowStrikeDriverResume
+    loads the filter at install time and logged success with HRESULT 0x00000000; 116
+    seconds later IPCManager logged "FilterLoad('PhantomSensor') failed: 0x80070420" at
+    ERROR. The driver was loaded, and the deferral producing that order is deliberate and
+    documented as preventing a post-FilterLoad ConnectNotify storm on first boot.
+
+    The cost was not only cosmetic: the caller treats FAILED(hr) as grounds to raise
+    NotifyError("Minifilter load failed") to the user, so a healthy machine reported a
+    driver-load failure it never suffered. It cost triage time twice in one day.
+    """
+
+    def test_an_already_resident_minifilter_is_not_reported_as_a_failure(self) -> None:
+        source = strip_c_comments(read_source(IPC_MANAGER_CPP_PATH))
+        marker = source.find("EnsurePhantomMinifilterLoaded")
+        self.assertGreater(
+            marker, -1, msg="the minifilter load helper is gone")
+        brace = source.index("{", marker)
+        depth = 0
+        end = brace
+        for i in range(brace, len(source)):
+            if source[i] == "{":
+                depth += 1
+            elif source[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        body = source[marker:end]
+
+        self.assertGreater(
+            body.count("ERROR_SERVICE_ALREADY_RUNNING"),
+            0,
+            msg=(
+                "an already-resident minifilter reports ERROR_SERVICE_ALREADY_RUNNING "
+                "(0x80070420) and this function does not recognise it, so the designed "
+                "outcome is reported as a driver-load failure and raises NotifyError to "
+                "the user on a healthy machine"
+            ),
+        )
+        # Anti-vacuity: recognising the code is only useful if it is treated as success.
+        recognised = body.find("ERROR_SERVICE_ALREADY_RUNNING")
+        window = body[recognised:recognised + 400]
+        self.assertGreater(
+            window.count("return S_OK"),
+            0,
+            msg=(
+                "the already-running code is recognised but not treated as success, so "
+                "the caller still records a failure and notifies the user"
+            ),
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

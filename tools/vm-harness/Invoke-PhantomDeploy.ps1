@@ -6,7 +6,7 @@
 .DESCRIPTION
     Full automated pipeline:
       1. MSBuild: PhantomCoreLib (if -RebuildLib) + service + UI + tray
-      2. Package: MSI → Bundle (wix build)
+      2. Package: MSI -> Bundle (wix build)
       3. Sign: packaging\signing\Sign-PhantomHome.ps1
       4. Stage: copy installers and build artifacts to vm_shrd\PhantomHome\
       5. Submit job manifest to vm_shrd\auto\jobs\
@@ -48,7 +48,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# ── PATHS ────────────────────────────────────────────────────────────────────
+# -- PATHS --------------------------------------------------------------------
 $RepoRoot    = $PSScriptRoot | Split-Path | Split-Path  # tools\vm-harness -> tools -> root
 $BinDir      = Join-Path $RepoRoot 'bin\Release'
 $StagingDir  = Join-Path $RepoRoot 'build\installer\staging'
@@ -100,7 +100,7 @@ $DevCerPath  = Join-Path $SigningDir 'ShadowStrike-Dev.cer'
 New-Item -ItemType Directory -Force -Path $JobsDir    | Out-Null
 New-Item -ItemType Directory -Force -Path $ResultsDir | Out-Null
 
-# ── LOGGING ──────────────────────────────────────────────────────────────────
+# -- LOGGING ------------------------------------------------------------------
 function Log { param($Msg) Write-Host "[$(Get-Date -Format 'HH:mm:ss')] $Msg" }
 function Die { param($Msg) Write-Error $Msg; exit 1 }
 
@@ -111,7 +111,7 @@ function Require-File {
     }
 }
 
-# ── SIGNING HELPERS ──────────────────────────────────────────────────────────
+# -- SIGNING HELPERS ----------------------------------------------------------
 function Get-LatestSigntoolPath {
     $candidates = @(
         'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe',
@@ -140,7 +140,7 @@ function Get-LatestInf2CatPath {
     return $null
 }
 
-# ── CERTIFICATE IDENTITY ─────────────────────────────────────────────────────
+# -- CERTIFICATE IDENTITY -----------------------------------------------------
 # Both helpers return the SHA-256 of the certificate's SUBJECT PUBLIC KEY, as
 # uppercase hex.
 #
@@ -384,7 +384,7 @@ function Assert-MsiAuthoring {
             $failures.Add('CmpInstallAnchor registry component is missing')
         }
 
-        # ── PhantomCortex model-store pointer ──
+        # -- PhantomCortex model-store pointer --
         # CortexConfigManager::LoadFromRegistry reads
         # HKLM\SOFTWARE\ShadowStrike\PhantomCortex\ModelDirectory (CortexConfig.cpp:65).
         # That reader existed for a long time with NO writer in any shipped installer -
@@ -403,7 +403,7 @@ function Assert-MsiAuthoring {
             $failures.Add('ProgramData\ShadowStrike\Models directory is missing')
         }
 
-        # ── Trust-root cert + ExecInstallRootCert authoring assertions ──
+        # -- Trust-root cert + ExecInstallRootCert authoring assertions --
         if ($content -notmatch '<Component\b[^>]*\bId="CmpShadowStrikeRootCert"') {
             $failures.Add('CmpShadowStrikeRootCert component is missing')
         }
@@ -467,7 +467,7 @@ function Assert-MsiAuthoring {
     }
 }
 
-# ── BUILD ────────────────────────────────────────────────────────────────────
+# -- BUILD --------------------------------------------------------------------
 # PreferredToolArchitecture=x64 forces the 64-bit-hosted cl.exe; the default
 # HostX86 toolchain runs out of heap on PhantomEmulator/JIT/JITCompiler.cpp
 # (large `std::array<RuntimeBlock, 4096>` value-init exceeds 32-bit cl's
@@ -502,7 +502,7 @@ if (-not $SkipBuild) {
 
     Sync-QtRuntimeStaging
 
-    # ── Sign C++ artifacts BEFORE they get embedded into the MSI. ─────────
+    # -- Sign C++ artifacts BEFORE they get embedded into the MSI. ---------
     # The wix build packages whatever bin\Release contains right now into the
     # CAB; if we sign after wix build, the MSI ships unsigned copies of the
     # service/UI/tray/driver-resume EXEs even though the on-disk copies are
@@ -528,7 +528,7 @@ if (-not $SkipBuild) {
 
     Copy-ProductExecutablesToStaging
 
-    # ── Stage the dev trust-root .cer for the MSI Certs\ component. ────────
+    # -- Stage the dev trust-root .cer for the MSI Certs\ component. --------
     $stagingCertsDir = Join-Path $StagingDir 'Certs'
     New-Item -ItemType Directory -Force -Path $stagingCertsDir | Out-Null
     Require-File -Path $DevCerPath -Label 'ShadowStrike-Dev.cer'
@@ -549,7 +549,7 @@ if (-not $SkipBuild) {
     }
 }
 
-# ── DETECTION CONTENT ────────────────────────────────────────────────────────
+# -- DETECTION CONTENT --------------------------------------------------------
 # Stage signatures.sdb and its attribution manifest for CmpDetectionContent.
 #
 # This runs for both the build and -SkipBuild paths, because the MSI needs the
@@ -753,7 +753,7 @@ driver build fails inf2cat with an error that names nothing useful:
             $drvVersion.Trim(), $FileVersionFull)
     }
 
-    # ── Expected signer: the certificate the MSI ships and DriverResume trusts ──
+    # -- Expected signer: the certificate the MSI ships and DriverResume trusts --
     # Pinned to the SUBJECT PUBLIC KEY (SPKI SHA-256), not the thumbprint,
     # so reissuing the certificate with the same key does not break the check
     # while a different key does.
@@ -825,7 +825,7 @@ driver build fails inf2cat with an error that names nothing useful:
     Copy-Item $infSrc (Join-Path $stagingDrvDir 'PhantomSensor.inf') -Force
     Copy-Item $catSrc (Join-Path $stagingDrvDir 'PhantomSensor.cat') -Force
 
-    # ── Assert on the STAGED copies, because those are what wix packages. ──────
+    # -- Assert on the STAGED copies, because those are what wix packages. ------
     # Verifying the build output is what let the last defect ship: the build tree
     # and the staged tree disagreed and only the staged one reaches the MSI.
     $stagedSys = Join-Path $stagingDrvDir 'PhantomSensor.sys'
@@ -877,7 +877,7 @@ This is exactly what shipped in 1.0.92. Do not work around this check.
 Sync-DriverStaging
 Sync-DetectionContentStaging
 
-# ── PACKAGE ──────────────────────────────────────────────────────────────────
+# -- PACKAGE ------------------------------------------------------------------
 Log "Building MSI..."
 New-Item -ItemType Directory -Force -Path $MsiObjDir | Out-Null
 wix build -arch x64 `
@@ -912,7 +912,7 @@ wix build -arch x64 `
     -o $BundleOut 2>&1 | Tee-Object -Variable bundleOut
 if ($LASTEXITCODE -ne 0) { Die "Bundle build failed" }
 
-# ── SIGN ─────────────────────────────────────────────────────────────────────
+# -- SIGN ---------------------------------------------------------------------
 # After wix build, sign the MSI and bundle.  EXEs in bin\Release were already
 # signed before staging so the MSI's CAB ships signed payloads; we still call
 # Sign-PhantomHome.ps1 here to (a) re-verify those signatures via signtool /pa,
@@ -924,7 +924,7 @@ if (-not $SkipSign) {
     pwsh -File $signScript
     if ($LASTEXITCODE -ne 0) { Die "Signing failed" }
 
-    # ── Assert all 6 final artifacts carry an Authenticode signature. ──────
+    # -- Assert all 6 final artifacts carry an Authenticode signature. ------
     $signedArtifacts = @(
         (Join-Path $BinDir   'ShadowStrikePhantomService.exe'),
         (Join-Path $BinDir   'ShadowStrikePhantomTray.exe'),
@@ -939,7 +939,7 @@ if (-not $SkipSign) {
     Assert-ArtifactsSigned -Paths $signedArtifacts
 }
 
-# ── DEPLOY TO vm_shrd ────────────────────────────────────────────────────────
+# -- DEPLOY TO vm_shrd --------------------------------------------------------
 New-Item -ItemType Directory -Force -Path $VmShared | Out-Null
 Remove-Item (Join-Path $VmShared '*.exe') -Force -ErrorAction SilentlyContinue
 Remove-Item (Join-Path $VmShared '*.msi') -Force -ErrorAction SilentlyContinue
@@ -1015,7 +1015,7 @@ foreach ($artifact in Get-ChildItem $VmShared -File -Recurse -ErrorAction Silent
 }
 $hashLines | Out-File (Join-Path $VmShared 'SHA256SUMS.txt') -Encoding ascii -Force
 
-Log "Deployed — EXE: $bundleHash"
+Log "Deployed - EXE: $bundleHash"
 Log "           MSI: $msiHash"
 
 if ($NoVMRun) {
@@ -1023,7 +1023,7 @@ if ($NoVMRun) {
     exit 0
 }
 
-# ── SUBMIT JOB ───────────────────────────────────────────────────────────────
+# -- SUBMIT JOB ---------------------------------------------------------------
 $jobId = "job-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
 $jobFile = Join-Path $JobsDir "$jobId.json"
 
@@ -1131,7 +1131,7 @@ $job = [ordered]@{
 $job | ConvertTo-Json -Depth 5 | Out-File $jobFile -Encoding utf8 -Force
 Log "Job submitted: $jobId"
 
-# ── POLL FOR RESULTS ─────────────────────────────────────────────────────────
+# -- POLL FOR RESULTS ---------------------------------------------------------
 Log "Waiting for VM agent to complete job (timeout=${JobTimeout}s)..."
 $deadline   = [DateTime]::UtcNow.AddSeconds($JobTimeout)
 $statusFile = Join-Path $ResultsDir "$jobId\status.json"
@@ -1152,7 +1152,7 @@ while ([DateTime]::UtcNow -lt $deadline) {
     }
 }
 
-# ── PRINT RESULTS ────────────────────────────────────────────────────────────
+# -- PRINT RESULTS ------------------------------------------------------------
 $resultDir  = Join-Path $ResultsDir $jobId
 $statusObj  = $null
 if (Test-Path $statusFile) {
@@ -1176,9 +1176,9 @@ if (Test-Path $logsDir) {
     $logFiles = Get-ChildItem $logsDir -File | Sort-Object Name
     foreach ($lf in $logFiles) {
         Log ""
-        Log "════════════════════════════════════════════════"
+        Log "================================================"
         Log "  LOG: $($lf.Name) ($([Math]::Round($lf.Length/1KB,1)) KB)"
-        Log "════════════════════════════════════════════════"
+        Log "================================================"
         Get-Content $lf.FullName | Write-Host
     }
 }
@@ -1189,9 +1189,9 @@ if (Test-Path $cmdDir) {
     $cmdFiles = Get-ChildItem $cmdDir -File | Sort-Object Name
     foreach ($cf in $cmdFiles) {
         Log ""
-        Log "────────────────────────────────────────────────"
+        Log "------------------------------------------------"
         Log "  CMD: $($cf.Name)"
-        Log "────────────────────────────────────────────────"
+        Log "------------------------------------------------"
         Get-Content $cf.FullName | Write-Host
     }
 }
