@@ -7841,6 +7841,37 @@ public:
         // belongs to. Both snapshots are lock-free reads of relaxed atomics (16
         // and 12 loads, both noexcept), so this costs nothing at report cadence
         // and takes no lock that the scan path holds.
+        // THE SCAN ENGINE'S OWN COUNTERS, WHICH NOTHING HAS EVER READ.
+        //
+        // ScanEngine::GetStatistics() had ZERO callers outside the engine and its tests,
+        // so all twenty-one counters in the snapshot were computed and discarded. Two of
+        // them exist specifically to answer questions a field run cannot otherwise
+        // answer, and both were unreadable:
+        //
+        //   heuristicVerdictsSuppressedByTrust - its own comment says it is "reported so
+        //   a field run can distinguish 'no false positives' from 'the suppression never
+        //   ran'". Those are opposite conditions that look identical in a threat count.
+        //   The 1.0.112 run produced a false positive on a Microsoft system binary and
+        //   this counter could not be consulted.
+        //
+        //   scansTruncatedByBudget - the observable for the on-access deadline. Whether
+        //   the engine now answers inside the window the kernel waits is exactly what
+        //   this number says, and it has to be readable against the kernel's own
+        //   timeouts and circuitOpen counters in the same report.
+        //
+        // archivesScanned and archiveFilesScanned were added to the snapshot earlier
+        // with a comment noting that "no caller could read them" - and the accessor
+        // still had no caller, so that fix moved the problem one level out rather than
+        // closing it. This closes it.
+        try {
+            Utils::Logger::Info(
+                "RealTimeProtection: scanEngine - {}",
+                Core::Engine::ScanEngine::Instance().GetStatistics().ToJson());
+        } catch (...) {
+            Utils::Logger::Warn(
+                "RealTimeProtection: scan engine statistics unavailable this interval");
+        }
+
         try {
             Utils::Logger::Info(
                 "RealTimeProtection: trust - signature={} certificate={}",

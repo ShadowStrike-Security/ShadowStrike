@@ -5399,6 +5399,43 @@ void ScanEngine::OptimizeForWorkload(ScanProfile profile) {
     SS_LOG_INFO(L"ScanEngine", L"Optimized for profile %d", static_cast<int>(profile));
 }
 
+std::string ScanEngine::Stats::ToJson() const {
+    // EVERY FIELD, INCLUDING THE ONES THAT ARE STRUCTURALLY ZERO.
+    //
+    // avgWhitelistTimeUs, avgHashTimeUs, avgSignatureTimeMs, avgHeuristicTimeMs and
+    // bytesPerSecond have NO PRODUCER: GetStatistics never assigns them, and they are
+    // only zero rather than garbage because both of its construction sites use Stats{}.
+    // They are emitted anyway, deliberately. A reader who sees a permanent zero will
+    // ask why; a field silently omitted from the report is how twenty counters came to
+    // be written and never read. Zero here means NOT COMPUTED, not "measured as zero".
+    std::ostringstream oss;
+    oss << "{";
+    oss << "\"totalScans\":" << totalScans << ",";
+    oss << "\"infectionsFound\":" << infectionsFound << ",";
+    oss << "\"cacheHits\":" << cacheHits << ",";
+    oss << "\"whitelistHits\":" << whitelistHits << ",";
+    oss << "\"averageScanTimeMs\":" << averageScanTimeMs << ",";
+    oss << "\"hashHits\":" << hashHits << ",";
+    oss << "\"signatureHits\":" << signatureHits << ",";
+    oss << "\"heuristicHits\":" << heuristicHits << ",";
+    oss << "\"behaviorHits\":" << behaviorHits << ",";
+    oss << "\"mlHits\":" << mlHits << ",";
+    oss << "\"avgWhitelistTimeUs\":" << avgWhitelistTimeUs << ",";
+    oss << "\"avgHashTimeUs\":" << avgHashTimeUs << ",";
+    oss << "\"avgSignatureTimeMs\":" << avgSignatureTimeMs << ",";
+    oss << "\"avgHeuristicTimeMs\":" << avgHeuristicTimeMs << ",";
+    oss << "\"filesPerSecond\":" << filesPerSecond << ",";
+    oss << "\"bytesPerSecond\":" << bytesPerSecond << ",";
+    oss << "\"archivesScanned\":" << archivesScanned << ",";
+    oss << "\"archiveFilesScanned\":" << archiveFilesScanned << ",";
+    oss << "\"heuristicVerdictsSuppressedByTrust\":"
+        << heuristicVerdictsSuppressedByTrust << ",";
+    oss << "\"heuristicSkippedOnKnownTrust\":" << heuristicSkippedOnKnownTrust << ",";
+    oss << "\"scansTruncatedByBudget\":" << scansTruncatedByBudget;
+    oss << "}";
+    return oss.str();
+}
+
 ScanEngine::Stats ScanEngine::GetStatistics() const {
     if (!m_impl) return Stats{};
 

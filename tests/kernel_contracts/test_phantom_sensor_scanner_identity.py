@@ -138,6 +138,7 @@ FILE_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.cpp"
 FILE_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.hpp"
 DATABASE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Database/DatabaseManager.cpp"
 SCAN_ENGINE_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
+SCAN_ENGINE_HPP_PATH = SCAN_ENGINE_CPP_PATH.with_suffix(".hpp")
 MEMORY_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/MemoryUtils.hpp"
 MEMORY_PROTECTION_CPP_PATH = (
     ROOT / "src/PhantomCore/SelfProtection/MemoryProtection.cpp"
@@ -22110,6 +22111,117 @@ class OnAccessScanBudgetContractTests(unittest.TestCase):
                      "UpdateFileVerdictCache(fileIdentityKey"):
             self.assertGreater(
                 rtp.count(call), 0, msg=f"{call} has been removed entirely")
+
+
+class ScanEngineStatisticsReadabilityContractTests(unittest.TestCase):
+    """A counter nobody can read cannot answer a question.
+
+    ScanEngine::GetStatistics() had NO caller outside the engine and its own tests, so
+    all twenty-one counters in the snapshot were computed on every call and discarded.
+    Two of them exist specifically to answer questions a field run cannot otherwise
+    answer:
+
+      heuristicVerdictsSuppressedByTrust - its own comment states it is "reported so a
+      field run can distinguish 'no false positives' from 'the suppression never ran'".
+      Those are opposite conditions and identical in a threat count. The 1.0.112 run
+      produced a false positive on a Microsoft system binary while this was unreadable.
+
+      scansTruncatedByBudget - the observable for the on-access deadline.
+
+    archivesScanned and archiveFilesScanned had already been added to the snapshot with a
+    comment noting "no caller could read them", which moved the problem one level out
+    rather than closing it: the accessor still had no caller.
+
+    NOT ONE of the twenty-one fields had a default member initialiser. They read zero
+    only because both construction sites happen to use Stats{}. A future `Stats s;`
+    would read garbage - which is the failure class task 216 is open on.
+    """
+
+    @staticmethod
+    def _stats_fields() -> list:
+        """Field names of ScanEngine::Stats, derived from the header."""
+        source = read_source(SCAN_ENGINE_HPP_PATH)
+        start = source.find("    struct Stats {")
+        if start == -1:
+            raise AssertionError("ScanEngine::Stats is gone")
+        end = source.index("\n    };", start)
+        block = source[start:end]
+        return re.findall(
+            r"^\s*(?:uint64_t|double|uint32_t|size_t)\s+(\w+)\s*[;=]",
+            block, re.M)
+
+    def test_every_statistics_field_has_a_default_initialiser(self) -> None:
+        """So a snapshot can never report memory nobody wrote.
+
+        This is the general form of the defect task 216 is open on: a field read without
+        being written reports whatever happened to be at that offset, and a constant
+        implausible value in a field log is the only symptom.
+        """
+        source = read_source(SCAN_ENGINE_HPP_PATH)
+        start = source.find("    struct Stats {")
+        self.assertGreater(start, -1, msg="ScanEngine::Stats is gone")
+        block = source[start:source.index("\n    };", start)]
+
+        uninitialised = re.findall(
+            r"^\s*(?:uint64_t|double|uint32_t|size_t)\s+(\w+)\s*;", block, re.M)
+        self.assertEqual(
+            [],
+            uninitialised,
+            msg=(
+                "these statistics fields have no default initialiser, so any construction "
+                "that is not brace-initialised reports memory nobody wrote: "
+                f"{uninitialised}"
+            ),
+        )
+
+    def test_every_statistics_field_is_emitted_by_the_serialiser(self) -> None:
+        """Derived subject, so a field added later cannot be silently unreported.
+
+        A hand-picked format string is how twenty-one counters came to be written and
+        never read. The subject list here comes from the struct itself, so the only way
+        to add an invisible counter is to make this test fail.
+        """
+        fields = self._stats_fields()
+        self.assertGreaterEqual(
+            len(fields), 15,
+            msg=f"only {len(fields)} statistics fields found; the walk is not working")
+
+        engine = strip_c_comments(read_source(SCAN_ENGINE_CPP_PATH))
+        marker = engine.find("std::string ScanEngine::Stats::ToJson() const")
+        self.assertGreater(marker, -1, msg="the statistics serialiser is gone")
+        body = engine[marker:engine.index("\n}", marker)]
+
+        # The quoted KEY, not merely the field name: every field appears in the body
+        # anyway as the streamed variable, so searching for the bare name would make
+        # this test satisfiable by a serialiser that emits nothing at all.
+        missing = [f for f in fields
+                   if ('\\"' + f + '\\":') not in body or ("<< " + f) not in body]
+        self.assertEqual(
+            [],
+            missing,
+            msg=(
+                "these counters are maintained but never serialised, so no field run can "
+                f"read them: {missing}"
+            ),
+        )
+
+    def test_the_periodic_report_reads_the_scan_engine_statistics(self) -> None:
+        """Anti-vacuity for both tests above, which a serialiser with no caller satisfies.
+
+        The engine could serialise all twenty-one counters perfectly and still be
+        unreadable, which was the situation before this change.
+        """
+        rtp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        self.assertEqual(
+            1,
+            rtp.count("ScanEngine::Instance().GetStatistics().ToJson()"),
+            msg=(
+                "the periodic report does not read the scan engine's statistics. The "
+                "snapshot is computed and discarded, which is how heuristicVerdicts"
+                "SuppressedByTrust - the designated observable for false-positive "
+                "suppression - became unreadable during a run that produced one"
+            ),
+        )
 
 
 if __name__ == "__main__":

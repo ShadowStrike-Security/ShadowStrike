@@ -1035,28 +1035,28 @@ public:
      * @brief Get internal statistics.
      */
     struct Stats {
-        uint64_t totalScans;
-        uint64_t infectionsFound;
-        uint64_t cacheHits;
-        uint64_t whitelistHits;
-        double averageScanTimeMs;
+        uint64_t totalScans = 0;
+        uint64_t infectionsFound = 0;
+        uint64_t cacheHits = 0;
+        uint64_t whitelistHits = 0;
+        double averageScanTimeMs = 0;
 
         // Extended stats
-        uint64_t hashHits;
-        uint64_t signatureHits;
-        uint64_t heuristicHits;
-        uint64_t behaviorHits;
-        uint64_t mlHits;
+        uint64_t hashHits = 0;
+        uint64_t signatureHits = 0;
+        uint64_t heuristicHits = 0;
+        uint64_t behaviorHits = 0;
+        uint64_t mlHits = 0;
 
         // Pipeline timing
-        double avgWhitelistTimeUs;
-        double avgHashTimeUs;
-        double avgSignatureTimeMs;
-        double avgHeuristicTimeMs;
+        double avgWhitelistTimeUs = 0;
+        double avgHashTimeUs = 0;
+        double avgSignatureTimeMs = 0;
+        double avgHeuristicTimeMs = 0;
 
         // Throughput
-        uint64_t filesPerSecond;
-        uint64_t bytesPerSecond;
+        uint64_t filesPerSecond = 0;
+        uint64_t bytesPerSecond = 0;
 
         // Archives. These two are incremented by ScanArchive but were absent
         // from this snapshot, so no caller could read them - the archive
@@ -1067,20 +1067,20 @@ public:
         // actually extracted and examined, and without both a field log cannot
         // distinguish "no archives were seen" from "archives were seen and
         // silently not opened".
-        uint64_t archivesScanned;
-        uint64_t archiveFilesScanned;
+        uint64_t archivesScanned = 0;
+        uint64_t archiveFilesScanned = 0;
 
         // Reported so a field run can distinguish "no false positives"
         // from "the suppression never ran". Those are indistinguishable in
         // a threat count and are opposite conditions.
-        uint64_t heuristicVerdictsSuppressedByTrust;
+        uint64_t heuristicVerdictsSuppressedByTrust = 0;
 
     /// @brief Heuristic analyses skipped because trust was ALREADY established.
     ///
     /// Distinct from heuristicVerdictsSuppressedByTrust, which counts analyses that
     /// RAN and were then discarded.  This counts the ones that never had to run, so
     /// the two together say how much of that cost has actually been reclaimed.
-    uint64_t heuristicSkippedOnKnownTrust;
+    uint64_t heuristicSkippedOnKnownTrust = 0;
 
     /// @brief On-access scans that stopped early because the time budget expired.
     ///
@@ -1088,7 +1088,16 @@ public:
     /// window the kernel actually waits, instead of producing verdicts after the kernel
     /// has given up. What matters is the RATIO to totalScans, and that the kernel's own
     /// timeouts and circuitOpen counters fall as this one rises.
-    uint64_t scansTruncatedByBudget;
+    uint64_t scansTruncatedByBudget = 0;
+
+        /// @brief Serialise every counter in this struct.
+        ///
+        /// Emitted whole rather than as a hand-picked field list, for the reason
+        /// recorded on the trust-statistics report: a format string would silently stop
+        /// reporting any field added later, which is exactly how these counters became
+        /// invisible in the first place. A serialiser that lives on the struct cannot
+        /// drift from it.
+        [[nodiscard]] std::string ToJson() const;
     };
 
     [[nodiscard]] Stats GetStatistics() const;
