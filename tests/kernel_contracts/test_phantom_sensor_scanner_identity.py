@@ -138,6 +138,7 @@ FILE_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.cpp"
 FILE_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.hpp"
 DATABASE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Database/DatabaseManager.cpp"
 SCAN_ENGINE_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
+REPORT_GENERATOR_CPP_PATH = ROOT / "src" / "PhantomCore" / "Communication" / "ReportGenerator.cpp"
 SCAN_ENGINE_HPP_PATH = SCAN_ENGINE_CPP_PATH.with_suffix(".hpp")
 MEMORY_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/MemoryUtils.hpp"
 MEMORY_PROTECTION_CPP_PATH = (
@@ -22360,6 +22361,111 @@ class MinifilterLoadReportingContractTests(unittest.TestCase):
                 "the caller still records a failure and notifies the user"
             ),
         )
+
+
+class LogFormatWidthContractTests(unittest.TestCase):
+    """SS_LOG_* is printf-family over a wide format string (Logger::LogEx takes
+    const wchar_t* format and Logger.cpp formats with _vsnwprintf_s). In a wide
+    format, %s consumes a wchar_t*, so passing a narrow const char* makes the
+    formatter walk past the end of the narrow string hunting for a wide NUL.
+
+    The 1.0.94 field log caught exactly that in ReportGenerator: a format name
+    printed as CJK text which decoded to "PDF ArchiveData" - the literal "PDF"
+    plus whatever string data happened to follow it.
+
+    These tests pin the whole file rather than the eleven sites that were wrong,
+    so a call added later is covered without editing this test.
+    """
+
+    def _log_calls(self, source):
+        """Every SS_LOG_* invocation, brace-matched so multi-line calls are whole."""
+        calls = []
+        for m in re.finditer(r"SS_LOG_\w+\s*\(", source):
+            start = m.start()
+            open_paren = source.index("(", start)
+            depth = 0
+            i = open_paren
+            while i < len(source):
+                if source[i] == "(":
+                    depth += 1
+                elif source[i] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            calls.append((source[:start].count("\n") + 1, source[start:i + 1]))
+        return calls
+
+    def test_no_log_call_prints_a_narrow_string_through_a_wide_specifier(self):
+        source = strip_c_comments(read_source(REPORT_GENERATOR_CPP_PATH))
+        calls = self._log_calls(source)
+
+        # Anti-vacuity: a parser that finds nothing must not pass.
+        self.assertGreaterEqual(
+            len(calls), 30,
+            "expected ReportGenerator.cpp to contain many SS_LOG calls; found "
+            "%d, so the call parser is broken and this test proves nothing"
+            % len(calls))
+
+        offenders = []
+        for line_no, call in calls:
+            if re.search(r"%s(?![a-z])", call):
+                offenders.append(line_no)
+
+        self.assertEqual(
+            [], offenders,
+            "SS_LOG calls in ReportGenerator.cpp use a bare %s at lines "
+            + repr(offenders)
+            + ". In a wide format string %s means wchar_t*; use %ls for a wide "
+              "argument and %hs for a narrow one.")
+
+    def test_wide_path_arguments_are_paired_with_a_wide_specifier(self):
+        """The complement of the test above.
+
+        Clearing every bare %s could also be achieved by relabelling a WIDE
+        argument as %hs, which would be a new defect of the same family. So pin
+        the two arguments that are provably wide - both are wstring().c_str() -
+        to %ls, anchored on the distinguishing binding rather than a line number.
+        """
+        source = strip_c_comments(read_source(REPORT_GENERATOR_CPP_PATH))
+        calls = self._log_calls(source)
+
+        wide_bindings = [
+            "config.outputDirectory.wstring().c_str()",
+            "job.outputPath.wstring().c_str()",
+        ]
+        for binding in wide_bindings:
+            owning = [(ln, c) for ln, c in calls if binding in c]
+            # At least one owner, or the anchor has rotted and proves nothing.
+            self.assertGreaterEqual(
+                len(owning), 1,
+                "no SS_LOG call logs %s, so this assertion is no longer "
+                "anchored to the artifact" % binding)
+            # EVERY owner must pair it with a wide specifier. Two calls log the
+            # output directory - one was already correct before the fix - and
+            # both are pinned deliberately.
+            for line_no, call in owning:
+                self.assertIn(
+                    "%ls", call,
+                    "the SS_LOG call at line %d logs %s, which is a wide "
+                    "std::wstring, so it must use the %%ls specifier"
+                    % (line_no, binding))
+
+    def test_paths_are_not_narrowed_only_to_be_printed_by_a_wide_logger(self):
+        """WideToUtf8 converting a path to UTF-8 for a wide logger was how the
+        over-read got introduced. The logger takes wide strings, so a path must
+        reach it as a wide string.
+        """
+        source = strip_c_comments(read_source(REPORT_GENERATOR_CPP_PATH))
+        calls = self._log_calls(source)
+        self.assertGreaterEqual(len(calls), 30, "call parser found too few calls")
+
+        offenders = [ln for ln, call in calls if "WideToUtf8" in call]
+        self.assertEqual(
+            [], offenders,
+            "SS_LOG calls at lines " + repr(offenders) + " narrow a wide string "
+            "with WideToUtf8 only to hand it to a wide-format logger. Pass the "
+            "wstring directly with %ls.")
 
 
 if __name__ == "__main__":

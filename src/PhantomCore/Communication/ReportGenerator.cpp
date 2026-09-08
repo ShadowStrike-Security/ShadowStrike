@@ -536,8 +536,8 @@ bool ReportGeneratorImpl::Initialize(const ReportConfiguration& config) {
     m_initialized.store(true, std::memory_order_release);
     m_status.store(ReportModuleStatus::Running, std::memory_order_release);
 
-    SS_LOG_INFO(L"ReportGen", L"Initialized — output=%s, format=%s, retention=%dd",
-                WideToUtf8(config.outputDirectory.wstring()).c_str(),
+    SS_LOG_INFO(L"ReportGen", L"Initialized — output=%ls, format=%hs, retention=%dd",
+                config.outputDirectory.wstring().c_str(),
                 GetFormatName(config.defaultFormat).data(),
                 config.retentionDays);
     return true;
@@ -699,8 +699,8 @@ void ReportGeneratorImpl::ExecuteJob(ReportJob& job) {
         ArchiveReport(job);
         NotifyProgress(job.jobId, 100);
 
-        SS_LOG_INFO(L"ReportGen", L"Report generated: %s (%s, %llums, %s)",
-                    WideToUtf8(job.outputPath.wstring()).c_str(),
+        SS_LOG_INFO(L"ReportGen", L"Report generated: %ls (%hs, %llums, %hs)",
+                    job.outputPath.wstring().c_str(),
                     GetFormatName(job.format).data(),
                     elapsedMs, FormatFileSize(job.fileSize).c_str());
 
@@ -708,7 +708,7 @@ void ReportGeneratorImpl::ExecuteJob(ReportJob& job) {
         job.status = ReportStatus::Failed;
         job.errorMessage = std::string("Exception: ") + ex.what();
         m_stats.reportsFailed.fetch_add(1, std::memory_order_relaxed);
-        SS_LOG_ERROR(L"ReportGen", L"Report generation failed: %s", ex.what());
+        SS_LOG_ERROR(L"ReportGen", L"Report generation failed: %hs", ex.what());
         NotifyError(job.errorMessage, -3);
     }
 
@@ -772,7 +772,7 @@ void ReportGeneratorImpl::SchedulerLoop() {
         for (const auto& sched : dueSchedules) {
             auto range = CalculateTimeRange(sched.period);
             GenerateReportAsync(sched.reportType, sched.format, range, "");
-            SS_LOG_INFO(L"ReportGen", L"Scheduled report triggered: %s (%s)",
+            SS_LOG_INFO(L"ReportGen", L"Scheduled report triggered: %hs (%hs)",
                         sched.scheduleId.c_str(), GetReportTypeName(sched.reportType).data());
         }
     }
@@ -855,7 +855,7 @@ std::string ReportGeneratorImpl::GenerateReportAsync(
         m_jobCv.notify_one();
     }
 
-    SS_LOG_INFO(L"ReportGen", L"Async report queued: %s (%s, %s)",
+    SS_LOG_INFO(L"ReportGen", L"Async report queued: %hs (%hs, %hs)",
                 jobId.c_str(), GetReportTypeName(type).data(), GetFormatName(format).data());
     return jobId;
 }
@@ -1133,7 +1133,7 @@ std::string ReportGeneratorImpl::RenderFormat(
         case ReportFormat::RTF:
         case ReportFormat::XLSX:
             SS_LOG_WARN(L"ReportGen",
-                L"Format '%s' requires third-party renderer; falling back to HTML",
+                L"Format '%hs' requires third-party renderer; falling back to HTML",
                 GetFormatName(format).data());
             return RenderHtml(meta, sections);
 
@@ -1481,7 +1481,7 @@ bool ReportGeneratorImpl::WriteReportFile(const fs::path& path, const std::strin
         maxBytes = m_config.maxReportSizeMB * 1024ULL * 1024ULL;
     }
     if (content.size() > maxBytes) {
-        SS_LOG_ERROR(L"ReportGen", L"Report exceeds max size: %s > %llu MB",
+        SS_LOG_ERROR(L"ReportGen", L"Report exceeds max size: %hs > %llu MB",
                      FormatFileSize(content.size()).c_str(), maxBytes / (1024 * 1024));
         return false;
     }
@@ -1543,7 +1543,7 @@ bool ReportGeneratorImpl::ExportToSiem(const fs::path& outputPath, ReportFormat 
                                        const TimeRange& range) {
     if (siemFormat != ReportFormat::CEF && siemFormat != ReportFormat::LEEF &&
         siemFormat != ReportFormat::SYSLOG) {
-        SS_LOG_ERROR(L"ReportGen", L"Invalid SIEM format: %s", GetFormatName(siemFormat).data());
+        SS_LOG_ERROR(L"ReportGen", L"Invalid SIEM format: %hs", GetFormatName(siemFormat).data());
         return false;
     }
     auto meta = BuildMetadata(ReportType::SecurityAudit, range);
@@ -1734,7 +1734,7 @@ bool ReportGeneratorImpl::DeleteTemplate(const std::string& templateId) {
         [&](const ReportTemplate& t) { return t.templateId == templateId; });
     if (it == m_templates.end()) return false;
     if (it->isBuiltIn) {
-        SS_LOG_WARN(L"ReportGen", L"Cannot delete built-in template: %s", templateId.c_str());
+        SS_LOG_WARN(L"ReportGen", L"Cannot delete built-in template: %hs", templateId.c_str());
         return false;
     }
     m_templates.erase(it);
@@ -1756,7 +1756,7 @@ std::string ReportGeneratorImpl::CreateSchedule(const ReportSchedule& schedule) 
     std::unique_lock lock(m_schedulesMutex);
     m_schedules.push_back(std::move(sched));
 
-    SS_LOG_INFO(L"ReportGen", L"Schedule created: %s", sched.scheduleId.c_str());
+    SS_LOG_INFO(L"ReportGen", L"Schedule created: %hs", sched.scheduleId.c_str());
     return sched.scheduleId;
 }
 
@@ -2114,7 +2114,7 @@ void ReportGeneratorImpl::NotifyCompletion(const ReportJob& job) {
 }
 
 void ReportGeneratorImpl::NotifyError(const std::string& msg, int code) {
-    SS_LOG_ERROR(L"ReportGen", L"%s", msg.c_str());
+    SS_LOG_ERROR(L"ReportGen", L"%hs", msg.c_str());
     ReportErrorCallback cb;
     {
         std::lock_guard lock(m_callbackMutex);
